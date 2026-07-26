@@ -1,5 +1,6 @@
 import math
-from datetime import datetime, timezone
+from datetime import datetime, time as clock_time, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -546,11 +547,496 @@ def calculate_trade_setup(
     }
 
 
+def add_backtest_indicators(data):
+    """Calculate the same indicators used by the current trade setup."""
+    result = data.copy()
+
+    result["MA20"] = result["Close"].rolling(20).mean()
+    result["MA50"] = result["Close"].rolling(50).mean()
+
+    standard_deviation = result["Close"].rolling(20).std()
+
+    result["Upper Band"] = (
+        result["MA20"] + (2 * standard_deviation)
+    )
+
+    result["Lower Band"] = (
+        result["MA20"] - (2 * standard_deviation)
+    )
+
+    movement = result["Close"].diff()
+
+    average_gain = (
+        movement.clip(lower=0)
+        .rolling(14)
+        .mean()
+    )
+
+    average_loss = (
+        -movement.clip(upper=0)
+        .rolling(14)
+        .mean()
+    )
+
+    relative_strength = average_gain / average_loss
+
+    result["RSI"] = 100 - (
+        100 / (1 + relative_strength)
+    )
+
+    result.loc[
+        (average_gain == 0) & (average_loss == 0),
+        "RSI",
+    ] = 50.0
+
+    result.loc[
+        (average_gain > 0) & (average_loss == 0),
+        "RSI",
+    ] = 100.0
+
+    result.loc[
+        (average_gain == 0) & (average_loss > 0),
+        "RSI",
+    ] = 0.0
+
+    ema_12 = result["Close"].ewm(
+        span=12,
+        adjust=False,
+    ).mean()
+
+    ema_26 = result["Close"].ewm(
+        span=26,
+        adjust=False,
+    ).mean()
+
+    result["MACD"] = ema_12 - ema_26
+
+    result["Signal"] = result["MACD"].ewm(
+        span=9,
+        adjust=False,
+    ).mean()
+
+    result["Histogram"] = (
+        result["MACD"] - result["Signal"]
+    )
+
+    result["Average Volume 20"] = (
+        result["Volume"].rolling(20).mean()
+    )
+
+    return result
+
+
+def remove_unfinished_daily_bar(data):
+    """
+    Exclude today's daily candle while the regular U.S. session is open.
+
+    This prevents a partly formed daily candle from being treated as a
+    completed historical signal.
+    """
+    if data.empty:
+        return data
+
+    try:
+        now_eastern = datetime.now(
+            ZoneInfo("America/New_York")
+        )
+
+        last_timestamp = pd.Timestamp(data.index[-1])
+
+        if last_timestamp.tzinfo is not None:
+            last_date = (
+                last_timestamp
+                .tz_convert("America/New_York")
+                .date()
+            )
+        else:
+            last_date = last_timestamp.date()
+
+        market_is_not_finished = (
+            now_eastern.weekday() < 5
+            and now_eastern.time() < clock_time(16, 15)
+        )
+
+        if (
+            last_date == now_eastern.date()
+            and market_is_not_finished
+        ):
+            return data.iloc[:-1].copy()
+
+    except Exception:
+        return data
+
+    return data
+
+
+def run_strategy_backtest(
+    data,
+    test_start_date,
+    holding_days,
+    minimum_quality,
+    cost_bps_per_side,
+):
+    """
+    Backtest the dashboard's long/short setup without look-ahead bias.
+
+    A signal is calculated after a daily close. A qualifying position
+    enters at the next session's open and exits at the close after the
+    selected number of trading sessions. Only one position is open at
+    a time.
+    """
+    prepared = remove_unfinished_daily_bar(data)
+
+    prepared = prepared.dropna(
+        subset=[
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]
+    )
+
+    prepared = add_backtest_indicators(prepared)
+
+    required_columns = [
+        "Open",
+        "Close",
+        "MA20",
+        "MA50",
+        "RSI",
+        "MACD",
+        "Signal",
+        "Histogram",
+        "Upper Band",
+        "Lower Band",
+        "Average Volume 20",
+    ]
+
+    prepared = prepared.dropna(
+        subset=required_columns
+    )
+
+    trades = []
+    index_position = 1
+
+    while index_position < len(prepared) - holding_days:
+        signal_row = prepared.iloc[index_position]
+        previous_row = prepared.iloc[index_position - 1]
+
+        signal_date = pd.Timestamp(
+            prepared.index[index_position]
+        )
+
+        if signal_date.date() < test_start_date:
+            index_position += 1
+            continue
+
+        setup = calculate_trade_setup(
+            price=float(signal_row["Close"]),
+            previous_price=float(previous_row["Close"]),
+            ma20=float(signal_row["MA20"]),
+            ma50=float(signal_row["MA50"]),
+            rsi=float(signal_row["RSI"]),
+            macd=float(signal_row["MACD"]),
+            signal=float(signal_row["Signal"]),
+            histogram=float(signal_row["Histogram"]),
+            previous_histogram=float(
+                previous_row["Histogram"]
+            ),
+            upper_band=float(signal_row["Upper Band"]),
+            lower_band=float(signal_row["Lower Band"]),
+            latest_volume=int(signal_row["Volume"]),
+            average_volume_20=float(
+                signal_row["Average Volume 20"]
+            ),
+        )
+
+        qualifying_direction = setup["bias"] in (
+            "LONG BIAS",
+            "SHORT BIAS",
+        )
+
+        qualifying_quality = (
+            setup["setup_quality"] >= minimum_quality
+        )
+
+        if not (
+            qualifying_direction
+            and qualifying_quality
+        ):
+            index_position += 1
+            continue
+
+        entry_position = index_position + 1
+        exit_position = (
+            entry_position + holding_days - 1
+        )
+
+        if exit_position >= len(prepared):
+            break
+
+        entry_price = float(
+            prepared["Open"].iloc[entry_position]
+        )
+
+        exit_price = float(
+            prepared["Close"].iloc[exit_position]
+        )
+
+        if entry_price <= 0 or exit_price <= 0:
+            index_position += 1
+            continue
+
+        direction = (
+            "LONG"
+            if setup["bias"] == "LONG BIAS"
+            else "SHORT"
+        )
+
+        if direction == "LONG":
+            gross_return = (
+                exit_price / entry_price
+            ) - 1
+        else:
+            gross_return = (
+                entry_price / exit_price
+            ) - 1
+
+        round_trip_cost = (
+            2 * cost_bps_per_side / 10000
+        )
+
+        net_return = gross_return - round_trip_cost
+
+        trades.append(
+            {
+                "Signal Date": signal_date,
+                "Entry Date": pd.Timestamp(
+                    prepared.index[entry_position]
+                ),
+                "Exit Date": pd.Timestamp(
+                    prepared.index[exit_position]
+                ),
+                "Direction": direction,
+                "Setup Quality": int(
+                    setup["setup_quality"]
+                ),
+                "Direction Score": int(
+                    setup["direction_score"]
+                ),
+                "Entry Price": entry_price,
+                "Exit Price": exit_price,
+                "Gross Return": gross_return,
+                "Net Return": net_return,
+                "Winner": net_return > 0,
+            }
+        )
+
+        # Do not allow overlapping positions.
+        index_position = exit_position + 1
+
+    trades_frame = pd.DataFrame(trades)
+
+    return trades_frame, prepared
+
+
+def calculate_backtest_statistics(
+    trades,
+    prepared_history,
+):
+    """Calculate summary statistics and a comparison equity curve."""
+    if trades.empty:
+        return None
+
+    returns = trades["Net Return"].astype(float)
+
+    strategy_growth = (1 + returns).cumprod()
+
+    running_peak = strategy_growth.cummax()
+
+    drawdown = (
+        strategy_growth / running_peak
+    ) - 1
+
+    winning_returns = returns[returns > 0]
+    losing_returns = returns[returns <= 0]
+
+    if losing_returns.empty:
+        profit_factor = float("inf")
+    else:
+        profit_factor = (
+            winning_returns.sum()
+            / abs(losing_returns.sum())
+        )
+
+    first_entry_date = pd.Timestamp(
+        trades["Entry Date"].iloc[0]
+    )
+
+    last_exit_date = pd.Timestamp(
+        trades["Exit Date"].iloc[-1]
+    )
+
+    benchmark_prices = prepared_history.loc[
+        (
+            prepared_history.index
+            >= first_entry_date
+        )
+        & (
+            prepared_history.index
+            <= last_exit_date
+        ),
+        "Close",
+    ]
+
+    if benchmark_prices.empty:
+        buy_hold_return = 0.0
+    else:
+        buy_hold_return = (
+            float(benchmark_prices.iloc[-1])
+            / float(benchmark_prices.iloc[0])
+        ) - 1
+
+    equity_curve = pd.DataFrame(
+        {
+            "Strategy": 10000 * strategy_growth.values,
+        },
+        index=pd.to_datetime(
+            trades["Exit Date"]
+        ),
+    )
+
+    if not benchmark_prices.empty:
+        benchmark_at_exits = (
+            benchmark_prices
+            .reindex(
+                equity_curve.index,
+                method="ffill",
+            )
+        )
+
+        equity_curve["Buy and Hold"] = (
+            10000
+            * benchmark_at_exits
+            / float(benchmark_prices.iloc[0])
+        )
+
+    statistics = {
+        "total_trades": len(trades),
+        "win_rate": float(trades["Winner"].mean()),
+        "average_return": float(returns.mean()),
+        "median_return": float(returns.median()),
+        "total_return": float(
+            strategy_growth.iloc[-1] - 1
+        ),
+        "max_drawdown": float(drawdown.min()),
+        "profit_factor": float(profit_factor),
+        "buy_hold_return": float(buy_hold_return),
+        "equity_curve": equity_curve,
+    }
+
+    return statistics
+
+
+def build_direction_breakdown(trades):
+    """Summarize long and short trades separately."""
+    rows = []
+
+    for direction in ["LONG", "SHORT"]:
+        subset = trades[
+            trades["Direction"] == direction
+        ]
+
+        if subset.empty:
+            continue
+
+        rows.append(
+            {
+                "Direction": direction,
+                "Trades": len(subset),
+                "Win rate": subset["Winner"].mean(),
+                "Average return": (
+                    subset["Net Return"].mean()
+                ),
+                "Total compounded return": (
+                    (1 + subset["Net Return"])
+                    .prod()
+                    - 1
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def format_backtest_trade_table(trades):
+    """Format recent backtest trades for display."""
+    if trades.empty:
+        return trades
+
+    display = trades.copy()
+
+    for column in [
+        "Signal Date",
+        "Entry Date",
+        "Exit Date",
+    ]:
+        display[column] = pd.to_datetime(
+            display[column]
+        ).dt.strftime("%Y-%m-%d")
+
+    display["Entry Price"] = display[
+        "Entry Price"
+    ].map(lambda value: f"${value:,.2f}")
+
+    display["Exit Price"] = display[
+        "Exit Price"
+    ].map(lambda value: f"${value:,.2f}")
+
+    display["Gross Return"] = display[
+        "Gross Return"
+    ].map(lambda value: f"{value:+.2%}")
+
+    display["Net Return"] = display[
+        "Net Return"
+    ].map(lambda value: f"{value:+.2%}")
+
+    display["Result"] = display["Winner"].map(
+        {
+            True: "Win",
+            False: "Loss",
+        }
+    )
+
+    return display[
+        [
+            "Signal Date",
+            "Entry Date",
+            "Exit Date",
+            "Direction",
+            "Setup Quality",
+            "Direction Score",
+            "Entry Price",
+            "Exit Price",
+            "Net Return",
+            "Result",
+        ]
+    ]
+
+
+
 period_choices = {
     "6 months": "6mo",
     "1 year": "1y",
     "2 years": "2y",
     "5 years": "5y",
+}
+
+backtest_lookback_choices = {
+    "2 years": 2,
+    "5 years": 5,
+    "10 years": 10,
 }
 
 with st.form("analysis_form"):
@@ -569,6 +1055,40 @@ with st.form("analysis_form"):
         "VTI, VXUS, AAL, CVX, INTC",
     )
 
+    with st.expander("Backtesting Lab settings"):
+        backtest_lookback_label = st.selectbox(
+            "Historical test period",
+            list(backtest_lookback_choices.keys()),
+            index=1,
+        )
+
+        backtest_holding_days = st.selectbox(
+            "Hold each trade for",
+            [1, 3, 5, 10, 20],
+            index=2,
+            format_func=lambda value: (
+                f"{value} trading day"
+                if value == 1
+                else f"{value} trading days"
+            ),
+        )
+
+        backtest_minimum_quality = st.slider(
+            "Minimum setup quality required",
+            min_value=50,
+            max_value=90,
+            value=70,
+            step=5,
+        )
+
+        backtest_cost_bps = st.number_input(
+            "Estimated cost/slippage per side (basis points)",
+            min_value=0.0,
+            max_value=100.0,
+            value=5.0,
+            step=1.0,
+        )
+
     analyze = st.form_submit_button("Analyze")
 
 
@@ -584,6 +1104,31 @@ if analyze:
             history = stock.history(
                 period=period_choices[selected_period],
                 auto_adjust=False,
+            )
+
+            backtest_years = (
+                backtest_lookback_choices[
+                    backtest_lookback_label
+                ]
+            )
+
+            backtest_start_timestamp = (
+                pd.Timestamp.now(
+                    tz="America/New_York"
+                )
+                - pd.DateOffset(
+                    years=backtest_years
+                )
+            )
+
+            backtest_download_start = (
+                backtest_start_timestamp
+                - pd.DateOffset(days=180)
+            )
+
+            backtest_history = stock.history(
+                start=backtest_download_start.date().isoformat(),
+                auto_adjust=True,
             )
 
     except Exception as error:
@@ -759,8 +1304,37 @@ if analyze:
         average_volume_20=average_volume_20,
     )
 
+    try:
+        backtest_trades, prepared_backtest_history = (
+            run_strategy_backtest(
+                data=backtest_history,
+                test_start_date=(
+                    backtest_start_timestamp.date()
+                ),
+                holding_days=backtest_holding_days,
+                minimum_quality=(
+                    backtest_minimum_quality
+                ),
+                cost_bps_per_side=backtest_cost_bps,
+            )
+        )
+
+        backtest_statistics = (
+            calculate_backtest_statistics(
+                backtest_trades,
+                prepared_backtest_history,
+            )
+        )
+
+    except Exception as error:
+        backtest_trades = pd.DataFrame()
+        prepared_backtest_history = pd.DataFrame()
+        backtest_statistics = None
+        backtest_error = str(error)
+
     (
         trade_tab,
+        backtest_tab,
         summary_tab,
         price_tab,
         momentum_tab,
@@ -769,6 +1343,7 @@ if analyze:
     ) = st.tabs(
         [
             "Trade Setup",
+            "Backtesting Lab",
             "Summary",
             "Price Chart",
             "Momentum Charts",
@@ -869,6 +1444,392 @@ if analyze:
             "of making money. It does not know your entry, stop loss, "
             "position size, breaking news, or personal risk tolerance."
         )
+
+    with backtest_tab:
+        st.subheader(
+            f"{ticker} Backtesting Lab"
+        )
+
+        st.caption(
+            "This test recalculates the dashboard's indicators "
+            "using only information available at each historical "
+            "close. It enters at the next trading day's open and "
+            f"exits after {backtest_holding_days} trading "
+            "session(s)."
+        )
+
+        settings_column_1, settings_column_2, settings_column_3 = (
+            st.columns(3)
+        )
+
+        settings_column_1.metric(
+            "Test period",
+            backtest_lookback_label,
+        )
+
+        settings_column_2.metric(
+            "Minimum quality",
+            f"{backtest_minimum_quality} / 100",
+        )
+
+        settings_column_3.metric(
+            "Round-trip cost assumption",
+            f"{2 * backtest_cost_bps:.0f} basis points",
+        )
+
+        if backtest_statistics is None:
+            if "backtest_error" in locals():
+                st.error(
+                    "The historical test could not be completed: "
+                    + backtest_error
+                )
+            else:
+                st.info(
+                    "No completed historical trades met the "
+                    "selected rules."
+                )
+
+        else:
+            metric_1, metric_2, metric_3, metric_4, metric_5 = (
+                st.columns(5)
+            )
+
+            metric_1.metric(
+                "Completed trades",
+                f"{backtest_statistics['total_trades']}",
+            )
+
+            metric_2.metric(
+                "Historical win rate",
+                f"{backtest_statistics['win_rate']:.1%}",
+            )
+
+            metric_3.metric(
+                "Average trade",
+                f"{backtest_statistics['average_return']:+.2%}",
+            )
+
+            metric_4.metric(
+                "Compounded return",
+                f"{backtest_statistics['total_return']:+.1%}",
+            )
+
+            metric_5.metric(
+                "Maximum drawdown",
+                f"{backtest_statistics['max_drawdown']:.1%}",
+            )
+
+            comparison_1, comparison_2, comparison_3 = (
+                st.columns(3)
+            )
+
+            if math.isinf(
+                backtest_statistics["profit_factor"]
+            ):
+                profit_factor_text = "No losing trades"
+            else:
+                profit_factor_text = (
+                    f"{backtest_statistics['profit_factor']:.2f}"
+                )
+
+            comparison_1.metric(
+                "Profit factor",
+                profit_factor_text,
+            )
+
+            comparison_2.metric(
+                "Median trade",
+                f"{backtest_statistics['median_return']:+.2%}",
+            )
+
+            comparison_3.metric(
+                f"{ticker} buy-and-hold return",
+                f"{backtest_statistics['buy_hold_return']:+.1%}",
+            )
+
+            go.Scatter(
+                x=history.index,
+                y=history["MACD"],
+                mode="lines",
+                name="MACD",
+            )
+        )
+
+        macd_chart.add_trace(
+            go.Scatter(
+                x=history.index,
+                y=history["Signal"],
+                mode="lines",
+                name="Signal Line",
+            )
+        )
+
+        macd_chart.add_trace(
+            go.Bar(
+                x=history.index,
+                y=history["Histogram"],
+                name="Histogram",
+            )
+        )
+
+        macd_chart.update_layout(
+            height=450,
+            margin=dict(
+                l=10,
+                r=10,
+                t=30,
+                b=10,
+            ),
+        )
+
+        st.plotly_chart(
+            macd_chart,
+            use_container_width=True,
+        )
+
+    with watchlist_tab:
+        st.subheader("Watchlist snapshot")
+
+        watchlist_symbols = parse_watchlist(
+            watchlist_text,
+            ticker,
+        )
+
+        st.caption(
+            "The analyzed ticker is automatically included. "
+            "Up to eight symbols are shown."
+        )
+
+        try:
+            with st.spinner("Loading watchlist data..."):
+                (
+                    watchlist_table,
+                    normalized_prices,
+                    failed_symbols,
+                ) = build_watchlist_data(watchlist_symbols)
+
+        except Exception as error:
+            watchlist_table = pd.DataFrame()
+            normalized_prices = pd.DataFrame()
+            failed_symbols = watchlist_symbols
+
+            st.warning(
+                f"Watchlist data could not be loaded: {error}"
+            )
+
+        if watchlist_table.empty:
+            st.info(
+                "No usable watchlist data was returned."
+            )
+
+        else:
+            st.dataframe(
+                watchlist_table,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        if failed_symbols:
+            st.warning(
+                "No usable data was returned for: "
+                + ", ".join(failed_symbols)
+            )
+
+        if not normalized_prices.empty:
+            st.subheader("Three-month performance comparison")
+
+            comparison_chart = go.Figure()
+
+            for symbol in normalized_prices.columns:
+                comparison_chart.add_trace(
+                    go.Scatter(
+                        x=normalized_prices.index,
+                        y=normalized_prices[symbol],
+                        mode="lines",
+                        name=symbol,
+    )
+            st.subheader(
+                "Strategy equity versus buy and hold"
+            )
+
+            equity_figure = go.Figure()
+
+            equity_curve = (
+                backtest_statistics["equity_curve"]
+            )
+
+            for column in equity_curve.columns:
+                equity_figure.add_trace(
+                    go.Scatter(
+                        x=equity_curve.index,
+                        y=equity_curve[column],
+                        mode="lines",
+                        name=column,
+                    )
+                )
+
+            equity_figure.update_layout(
+                height=500,
+                yaxis_title=(
+                    "Hypothetical value of $10,000"
+                ),
+                margin=dict(
+                    l=10,
+                    r=10,
+                    t=30,
+                    b=10,
+                ),
+            )
+
+            st.plotly_chart(
+                equity_figure,
+                use_container_width=True,
+            )
+
+            st.subheader(
+                "Long and short results"
+            )
+
+            direction_breakdown = (
+                build_direction_breakdown(
+                    backtest_trades
+                )
+            )
+
+            if not direction_breakdown.empty:
+                display_breakdown = (
+                    direction_breakdown.copy()
+                )
+
+                display_breakdown["Win rate"] = (
+                    display_breakdown["Win rate"]
+                    .map(
+                        lambda value: (
+                            f"{value:.1%}"
+                        )
+                    )
+                )
+
+                display_breakdown["Average return"] = (
+                    display_breakdown[
+                        "Average return"
+                    ]
+                    .map(
+                        lambda value: (
+                            f"{value:+.2%}"
+                        )
+                    )
+                )
+
+                display_breakdown[
+                    "Total compounded return"
+                ] = (
+                    display_breakdown[
+                        "Total compounded return"
+                    ]
+                    .map(
+                        lambda value: (
+                            f"{value:+.1%}"
+                        )
+                    )
+                )
+
+                st.dataframe(
+                    display_breakdown,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+            current_direction = None
+
+            if trade_setup["bias"] == "LONG BIAS":
+                current_direction = "LONG"
+
+            elif trade_setup["bias"] == "SHORT BIAS":
+                current_direction = "SHORT"
+
+            st.subheader(
+                "Historical context for today's reading"
+            )
+
+            if current_direction is None:
+                st.info(
+                    "Today's dashboard reading is WAIT, "
+                    "so there is no matching long or short "
+                    "signal to compare."
+                )
+
+            else:
+                similar_trades = backtest_trades[
+                    backtest_trades["Direction"]
+                    == current_direction
+                ]
+
+                if similar_trades.empty:
+                    st.info(
+                        "No historical trades matched today's "
+                        f"{current_direction.lower()} direction "
+                        "under these settings."
+                    )
+
+                else:
+                    context_1, context_2, context_3 = (
+                        st.columns(3)
+                    )
+
+                    context_1.metric(
+                        "Matching past trades",
+                        f"{len(similar_trades)}",
+                    )
+
+                    context_2.metric(
+                        "Past win rate",
+                        (
+                            f"{similar_trades['Winner'].mean():.1%}"
+                        ),
+                    )
+
+                    context_3.metric(
+                        "Average past return",
+                        (
+                            f"{similar_trades['Net Return'].mean():+.2%}"
+                        ),
+                    )
+
+                    if len(similar_trades) < 10:
+                        st.warning(
+                            "This matching sample is small, so "
+                            "its win rate is especially uncertain."
+                        )
+
+            st.subheader(
+                "Most recent historical trades"
+            )
+
+            recent_trades = (
+                backtest_trades
+                .tail(20)
+                .sort_values(
+                    "Signal Date",
+                    ascending=False,
+                )
+            )
+
+            st.dataframe(
+                format_backtest_trade_table(
+                    recent_trades
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            st.warning(
+                "Historical win rate is not a probability that "
+                "the next trade will win. Results can change "
+                "substantially with the ticker, holding period, "
+                "quality threshold, costs, and market regime. "
+                "Short results do not include stock-borrow fees."
+            )
 
     with summary_tab:
         st.subheader(f"{ticker} snapshot")
