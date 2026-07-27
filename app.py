@@ -7,19 +7,730 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
+from streamlit_cookies_manager_ext import EncryptedCookieManager
+from supabase import create_client
 
 
 st.set_page_config(
-    page_title="Folsom's Trading Dashboard",
+    page_title="Folsom Trade Assistant",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("📈 Folsom's Trading Dashboard")
-st.caption(
-    "Technical indicators, company news, and market-mover screens "
-    "based on Yahoo Finance data."
+
+try:
+    cookie_password = st.secrets["COOKIE_PASSWORD"]
+except Exception:
+    st.error(
+        "COOKIE_PASSWORD is missing from Streamlit secrets. "
+        "Add it before using persistent sign-in."
+    )
+    st.stop()
+
+
+auth_cookies = EncryptedCookieManager(
+    prefix="folsom-trade-assistant/",
+    password=cookie_password,
 )
+
+if not auth_cookies.ready():
+    st.stop()
+
+
+st.title("📈 Folsom Trade Assistant")
+
+st.caption(
+    "A beginner-friendly decision dashboard for finding, "
+    "testing, entering, and tracking higher-quality trades."
+)
+
+
+def save_auth_tokens(access_token, refresh_token):
+    """Save Supabase tokens in Session State and encrypted browser cookies."""
+    st.session_state.supabase_access_token = access_token
+    st.session_state.supabase_refresh_token = refresh_token
+
+    auth_cookies["supabase_access_token"] = access_token
+    auth_cookies["supabase_refresh_token"] = refresh_token
+    auth_cookies.save()
+
+
+def remember_auth_response(response):
+    """Remember an authenticated Supabase response."""
+    if response.user:
+        st.session_state.supabase_user_id = str(response.user.id)
+        st.session_state.supabase_user_email = (
+            response.user.email or "Signed-in user"
+        )
+
+    if response.session:
+        save_auth_tokens(
+            response.session.access_token,
+            response.session.refresh_token,
+        )
+
+
+def clear_auth_state():
+    """Remove authentication from Session State and browser cookies."""
+    for key in [
+        "supabase_client",
+        "supabase_user_id",
+        "supabase_user_email",
+        "supabase_access_token",
+        "supabase_refresh_token",
+    ]:
+        st.session_state.pop(key, None)
+
+    for cookie_name in [
+        "supabase_access_token",
+        "supabase_refresh_token",
+    ]:
+        if cookie_name in auth_cookies:
+            del auth_cookies[cookie_name]
+
+    auth_cookies.save()
+
+
+def get_supabase_client():
+    """Create a client and restore a browser login when available."""
+    if "supabase_client" in st.session_state:
+        return st.session_state.supabase_client, None
+
+    try:
+        project_url = st.secrets["SUPABASE_URL"]
+        publishable_key = st.secrets["SUPABASE_KEY"]
+    except Exception:
+        return None, (
+            "Supabase credentials are missing. Add SUPABASE_URL and "
+            "SUPABASE_KEY to Streamlit secrets."
+        )
+
+    try:
+        client = create_client(project_url, publishable_key)
+
+        access_token = (
+            st.session_state.get("supabase_access_token")
+            or auth_cookies.get("supabase_access_token")
+        )
+        refresh_token = (
+            st.session_state.get("supabase_refresh_token")
+            or auth_cookies.get("supabase_refresh_token")
+        )
+
+        if access_token and refresh_token:
+            try:
+                restored = client.auth.set_session(
+                    access_token,
+                    refresh_token,
+                )
+                remember_auth_response(restored)
+            except Exception:
+                clear_auth_state()
+
+        st.session_state.supabase_client = client
+        return client, None
+
+    except Exception as error:
+        return None, f"Supabase connection failed: {error}"
+
+
+def load_cloud_trades(client, user_id):
+    """Load this user's active trades from Supabase."""
+    response = (
+        client.table("trades")
+        .select(
+            "id,ticker,direction,entry_price,stop_price,"
+            "target_price,quantity,status,created_at"
+        )
+        .eq("user_id", user_id)
+        .eq("status", "ACTIVE")
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+    return response.data or []
+
+
+def load_closed_trades(client, user_id, limit=20):
+    """Load recent completed trades for the authenticated user."""
+    response = (
+        client.table("trades")
+        .select(
+            "id,ticker,direction,entry_price,stop_price,"
+            "target_price,quantity,exit_price,status,notes,"
+            "created_at,closed_at"
+        )
+        .eq("user_id", user_id)
+        .eq("status", "CLOSED")
+        .order("closed_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    return response.data or []
+
+
+def add_cloud_trade(client, user_id, trade):
+    """Insert one active trade for the authenticated user."""
+    response = (
+        client.table("trades")
+        .insert(
+            {
+                "user_id": user_id,
+                "ticker": trade["ticker"],
+                "direction": trade["direction"],
+                "entry_price": trade["entry"],
+                "stop_price": trade["stop"],
+                "target_price": trade["target"],
+                "quantity": trade["quantity"],
+                "status": "ACTIVE",
+            }
+        )
+        .execute()
+    )
+
+    return response.data
+
+
+def close_cloud_trade(client, trade_id, exit_price, notes=""):
+    """Close an active trade and preserve it in trade history."""
+    response = (
+        client.table("trades")
+        .update(
+            {
+                "status": "CLOSED",
+                "exit_price": exit_price,
+                "notes": notes or None,
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", trade_id)
+        .execute()
+    )
+
+    return response.data
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_latest_trade_price(ticker):
+    """Return Yahoo's latest available price, cached for 60 seconds."""
+    symbol = ticker.strip().upper()
+    stock = yf.Ticker(symbol)
+
+    try:
+        fast_info = stock.fast_info
+        latest = fast_info.get("last_price")
+        if latest is not None and float(latest) > 0:
+            return float(latest)
+    except Exception:
+        pass
+
+    intraday = stock.history(
+        period="5d",
+        interval="5m",
+        prepost=True,
+        auto_adjust=False,
+    )
+
+    intraday = intraday.dropna(subset=["Close"])
+
+    if intraday.empty:
+        return None
+
+    return float(intraday["Close"].iloc[-1])
+
+
+def calculate_live_trade_metrics(trade, current_price):
+    """Calculate P/L, level distances, and an easy-to-read status."""
+    entry_price = float(trade["entry_price"])
+    stop_price = float(trade["stop_price"])
+    target_price = float(trade["target_price"])
+    quantity = int(trade.get("quantity") or 1)
+    direction = trade["direction"]
+
+    if direction == "LONG":
+        risk_per_share = entry_price - stop_price
+        reward_per_share = target_price - entry_price
+        pnl_per_share = current_price - entry_price
+        stop_distance = current_price - stop_price
+        target_distance = target_price - current_price
+        stop_hit = current_price <= stop_price
+        target_hit = current_price >= target_price
+    else:
+        risk_per_share = stop_price - entry_price
+        reward_per_share = entry_price - target_price
+        pnl_per_share = entry_price - current_price
+        stop_distance = stop_price - current_price
+        target_distance = current_price - target_price
+        stop_hit = current_price >= stop_price
+        target_hit = current_price <= target_price
+
+    total_pnl = pnl_per_share * quantity
+    pnl_percent = (
+        pnl_per_share / entry_price
+        if entry_price > 0
+        else 0.0
+    )
+
+    if target_hit:
+        status = "TARGET HIT"
+        status_kind = "success"
+    elif stop_hit:
+        status = "STOP LEVEL HIT"
+        status_kind = "error"
+    elif (
+        reward_per_share > 0
+        and target_distance <= reward_per_share * 0.25
+    ):
+        status = "NEAR TARGET"
+        status_kind = "success"
+    elif (
+        risk_per_share > 0
+        and stop_distance <= risk_per_share * 0.25
+    ):
+        status = "STOP AT RISK"
+        status_kind = "warning"
+    else:
+        status = "HOLD / MONITOR"
+        status_kind = "info"
+
+    return {
+        "quantity": quantity,
+        "risk_per_share": risk_per_share,
+        "reward_per_share": reward_per_share,
+        "pnl_per_share": pnl_per_share,
+        "total_pnl": total_pnl,
+        "pnl_percent": pnl_percent,
+        "stop_distance": max(0.0, stop_distance),
+        "target_distance": max(0.0, target_distance),
+        "status": status,
+        "status_kind": status_kind,
+    }
+
+
+def calculate_closed_trade_result(trade):
+    """Return realized P/L for one completed trade."""
+    entry_price = float(trade["entry_price"])
+    exit_price = float(trade["exit_price"])
+    quantity = int(trade.get("quantity") or 1)
+
+    if trade["direction"] == "LONG":
+        pnl_per_share = exit_price - entry_price
+    else:
+        pnl_per_share = entry_price - exit_price
+
+    return pnl_per_share * quantity
+
+
+supabase, supabase_error = get_supabase_client()
+logged_in = bool(st.session_state.get("supabase_user_id"))
+
+with st.sidebar:
+    st.header("👤 Account")
+
+    if supabase_error:
+        st.error(supabase_error)
+        st.caption(
+            "Stock analysis still works, but cloud trade saving is disabled."
+        )
+
+    elif not logged_in:
+        sign_in_tab, create_account_tab = st.tabs(
+            ["Sign in", "Create account"]
+        )
+
+        with sign_in_tab:
+            with st.form("sign_in_form"):
+                sign_in_email = st.text_input(
+                    "Email",
+                    key="sign_in_email",
+                ).strip()
+
+                sign_in_password = st.text_input(
+                    "Password",
+                    type="password",
+                    key="sign_in_password",
+                )
+
+                sign_in_clicked = st.form_submit_button(
+                    "Sign in",
+                    use_container_width=True,
+                )
+
+            if sign_in_clicked:
+                if not sign_in_email or not sign_in_password:
+                    st.error("Enter your email and password.")
+                else:
+                    try:
+                        auth_response = (
+                            supabase.auth.sign_in_with_password(
+                                {
+                                    "email": sign_in_email,
+                                    "password": sign_in_password,
+                                }
+                            )
+                        )
+                        remember_auth_response(auth_response)
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Sign-in failed: {error}")
+
+        with create_account_tab:
+            with st.form("create_account_form"):
+                create_email = st.text_input(
+                    "Email",
+                    key="create_email",
+                ).strip()
+
+                create_password = st.text_input(
+                    "Password",
+                    type="password",
+                    key="create_password",
+                )
+
+                create_password_again = st.text_input(
+                    "Confirm password",
+                    type="password",
+                    key="create_password_again",
+                )
+
+                create_clicked = st.form_submit_button(
+                    "Create account",
+                    use_container_width=True,
+                )
+
+            if create_clicked:
+                if not create_email or not create_password:
+                    st.error("Enter an email and password.")
+                elif create_password != create_password_again:
+                    st.error("The passwords do not match.")
+                elif len(create_password) < 8:
+                    st.error("Use a password with at least 8 characters.")
+                else:
+                    try:
+                        auth_response = supabase.auth.sign_up(
+                            {
+                                "email": create_email,
+                                "password": create_password,
+                            }
+                        )
+
+                        remember_auth_response(auth_response)
+
+                        if auth_response.session:
+                            st.rerun()
+                        else:
+                            st.success(
+                                "Account created. Check your email to "
+                                "confirm it, then return here and sign in."
+                            )
+                    except Exception as error:
+                        st.error(f"Account creation failed: {error}")
+
+        st.caption(
+            "Sign in once on each device. Encrypted browser cookies "
+            "restore your login after a refresh."
+        )
+
+    else:
+        user_email = st.session_state.get(
+            "supabase_user_email",
+            "Signed-in user",
+        )
+
+        st.success(f"Signed in as {user_email}")
+
+        if st.button(
+            "Sign out",
+            use_container_width=True,
+        ):
+            try:
+                supabase.auth.sign_out()
+            except Exception:
+                pass
+
+            clear_auth_state()
+            st.rerun()
+
+    st.divider()
+    st.header("📌 Active Trades")
+    st.caption("Prices are Yahoo Finance estimates and may be delayed.")
+
+    if not logged_in:
+        st.info("Sign in to save and sync active trades.")
+
+    else:
+        refresh_column, count_column = st.columns([1, 1])
+
+        if refresh_column.button(
+            "Refresh prices",
+            use_container_width=True,
+        ):
+            get_latest_trade_price.clear()
+            st.rerun()
+
+        try:
+            active_trades = load_cloud_trades(
+                supabase,
+                st.session_state.supabase_user_id,
+            )
+        except Exception as error:
+            active_trades = []
+            st.error(f"Cloud trades could not be loaded: {error}")
+
+        count_column.metric("Open", len(active_trades))
+
+        if active_trades:
+            for active_trade in active_trades:
+                entry_price = float(active_trade["entry_price"])
+                stop_price = float(active_trade["stop_price"])
+                target_price = float(active_trade["target_price"])
+                quantity = int(active_trade.get("quantity") or 1)
+                direction = active_trade["direction"]
+
+                try:
+                    current_price = get_latest_trade_price(
+                        active_trade["ticker"]
+                    )
+                except Exception:
+                    current_price = None
+
+                with st.container(border=True):
+                    st.markdown(
+                        f"### {active_trade['ticker']} — {direction}"
+                    )
+                    st.caption(f"{quantity} share(s)")
+
+                    if current_price is None:
+                        st.warning("Current price could not be loaded.")
+                        default_exit_price = entry_price
+                    else:
+                        metrics = calculate_live_trade_metrics(
+                            active_trade,
+                            current_price,
+                        )
+
+                        price_column, pnl_column = st.columns(2)
+
+                        price_column.metric(
+                            "Current",
+                            f"${current_price:,.2f}",
+                        )
+
+                        pnl_column.metric(
+                            "Unrealized P/L",
+                            f"${metrics['total_pnl']:+,.2f}",
+                            f"{metrics['pnl_percent']:+.2%}",
+                        )
+
+                        status_message = (
+                            f"{metrics['status']} — "
+                            f"${metrics['stop_distance']:.2f} from stop, "
+                            f"${metrics['target_distance']:.2f} from target."
+                        )
+
+                        if metrics["status_kind"] == "success":
+                            st.success(status_message)
+                        elif metrics["status_kind"] == "error":
+                            st.error(status_message)
+                        elif metrics["status_kind"] == "warning":
+                            st.warning(status_message)
+                        else:
+                            st.info(status_message)
+
+                        default_exit_price = current_price
+
+                    st.write(
+                        f"**Entry:** ${entry_price:.2f}  •  "
+                        f"**Stop:** ${stop_price:.2f}  •  "
+                        f"**Target:** ${target_price:.2f}"
+                    )
+
+                    with st.expander("Close this trade"):
+                        with st.form(
+                            f"close_trade_form_{active_trade['id']}"
+                        ):
+                            exit_price = st.number_input(
+                                "Exit price",
+                                min_value=0.01,
+                                value=float(default_exit_price),
+                                step=0.01,
+                                format="%.2f",
+                                key=f"exit_price_{active_trade['id']}",
+                            )
+
+                            close_notes = st.text_area(
+                                "Notes (optional)",
+                                key=f"close_notes_{active_trade['id']}",
+                                placeholder=(
+                                    "Why did you exit? What did you learn?"
+                                ),
+                            )
+
+                            close_clicked = st.form_submit_button(
+                                "Close and record trade",
+                                use_container_width=True,
+                            )
+
+                        if close_clicked:
+                            try:
+                                close_cloud_trade(
+                                    supabase,
+                                    active_trade["id"],
+                                    float(exit_price),
+                                    close_notes.strip(),
+                                )
+                                get_latest_trade_price.clear()
+                                st.rerun()
+                            except Exception as error:
+                                st.error(f"Trade close failed: {error}")
+        else:
+            st.info("No active trades yet.")
+
+        st.divider()
+        st.subheader("Add a trade")
+
+        with st.form("add_trade_form", clear_on_submit=True):
+            trade_ticker = st.text_input(
+                "Ticker"
+            ).strip().upper()
+
+            trade_direction = st.selectbox(
+                "Direction",
+                ["LONG", "SHORT"],
+            )
+
+            trade_quantity = st.number_input(
+                "Shares",
+                min_value=1,
+                value=1,
+                step=1,
+            )
+
+            trade_entry = st.number_input(
+                "Entry price",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+            )
+
+            trade_stop = st.number_input(
+                "Stop loss",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+            )
+
+            trade_target = st.number_input(
+                "Target price",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+            )
+
+            add_trade_clicked = st.form_submit_button(
+                "Add active trade",
+                use_container_width=True,
+            )
+
+        if add_trade_clicked:
+            missing_required_value = (
+                not trade_ticker
+                or trade_entry <= 0
+                or trade_stop <= 0
+                or trade_target <= 0
+            )
+
+            long_prices_invalid = (
+                trade_direction == "LONG"
+                and not (trade_stop < trade_entry < trade_target)
+            )
+
+            short_prices_invalid = (
+                trade_direction == "SHORT"
+                and not (trade_target < trade_entry < trade_stop)
+            )
+
+            if missing_required_value:
+                st.error("Enter a ticker, entry, stop, and target.")
+            elif long_prices_invalid:
+                st.error(
+                    "For a long trade, the stop must be below "
+                    "the entry and the target must be above it."
+                )
+            elif short_prices_invalid:
+                st.error(
+                    "For a short trade, the target must be below "
+                    "the entry and the stop must be above it."
+                )
+            else:
+                try:
+                    add_cloud_trade(
+                        supabase,
+                        st.session_state.supabase_user_id,
+                        {
+                            "ticker": trade_ticker,
+                            "direction": trade_direction,
+                            "quantity": int(trade_quantity),
+                            "entry": float(trade_entry),
+                            "stop": float(trade_stop),
+                            "target": float(trade_target),
+                        },
+                    )
+                    get_latest_trade_price.clear()
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Trade could not be saved: {error}")
+
+        try:
+            closed_trades = load_closed_trades(
+                supabase,
+                st.session_state.supabase_user_id,
+            )
+        except Exception as error:
+            closed_trades = []
+            st.error(f"Trade history could not be loaded: {error}")
+
+        if closed_trades:
+            with st.expander(
+                f"📚 Trade History ({len(closed_trades)})"
+            ):
+                realized_total = sum(
+                    calculate_closed_trade_result(trade)
+                    for trade in closed_trades
+                    if trade.get("exit_price") is not None
+                )
+
+                st.metric(
+                    "Realized P/L shown",
+                    f"${realized_total:+,.2f}",
+                )
+
+                history_rows = []
+
+                for trade in closed_trades:
+                    if trade.get("exit_price") is None:
+                        continue
+
+                    realized_pnl = calculate_closed_trade_result(trade)
+
+                    history_rows.append(
+                        {
+                            "Ticker": trade["ticker"],
+                            "Side": trade["direction"],
+                            "Shares": int(trade.get("quantity") or 1),
+                            "Entry": f"${float(trade['entry_price']):.2f}",
+                            "Exit": f"${float(trade['exit_price']):.2f}",
+                            "P/L": f"${realized_pnl:+.2f}",
+                        }
+                    )
+
+                if history_rows:
+                    st.dataframe(
+                        pd.DataFrame(history_rows),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
 
 
 def extract_number(value):
@@ -1039,57 +1750,80 @@ backtest_lookback_choices = {
     "10 years": 10,
 }
 
-with st.form("analysis_form"):
-    ticker = st.text_input(
-        "Enter a stock ticker",
-        "AAL",
-    ).strip().upper()
-
-    selected_period = st.selectbox(
-        "Choose a chart range",
-        list(period_choices.keys()),
+with st.container(border=True):
+    st.subheader("Analyze a stock")
+    st.caption(
+        "Enter a ticker, then open optional settings only when "
+        "you want to change the watchlist or backtest."
     )
 
-    watchlist_text = st.text_input(
-        "Watchlist tickers (separate them with commas)",
-        "VTI, VXUS, AAL, CVX, INTC",
-    )
+    with st.form("analysis_form"):
+        ticker_column, range_column = st.columns([2, 1])
 
-    with st.expander("Backtesting Lab settings"):
-        backtest_lookback_label = st.selectbox(
-            "Historical test period",
-            list(backtest_lookback_choices.keys()),
-            index=1,
+        with ticker_column:
+            ticker = st.text_input(
+                "Ticker",
+                "AAL",
+                help="Examples: AAL, INTC, CVX, VTI",
+            ).strip().upper()
+
+        with range_column:
+            selected_period = st.selectbox(
+                "Chart range",
+                list(period_choices.keys()),
+            )
+
+        with st.expander("Optional watchlist and backtest settings"):
+            watchlist_text = st.text_input(
+                "Watchlist tickers",
+                "VTI, VXUS, AAL, CVX, INTC",
+                help="Separate ticker symbols with commas.",
+            )
+
+            st.markdown("#### Backtesting")
+
+            backtest_column_1, backtest_column_2 = st.columns(2)
+
+            with backtest_column_1:
+                backtest_lookback_label = st.selectbox(
+                    "Historical test period",
+                    list(backtest_lookback_choices.keys()),
+                    index=1,
+                )
+
+                backtest_holding_days = st.selectbox(
+                    "Hold each trade for",
+                    [1, 3, 5, 10, 20],
+                    index=2,
+                    format_func=lambda value: (
+                        f"{value} trading day"
+                        if value == 1
+                        else f"{value} trading days"
+                    ),
+                )
+
+            with backtest_column_2:
+                backtest_minimum_quality = st.slider(
+                    "Minimum setup quality",
+                    min_value=50,
+                    max_value=90,
+                    value=70,
+                    step=5,
+                )
+
+                backtest_cost_bps = st.number_input(
+                    "Estimated cost per side (basis points)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=5.0,
+                    step=1.0,
+                )
+
+        analyze = st.form_submit_button(
+            "Analyze stock",
+            type="primary",
+            use_container_width=True,
         )
-
-        backtest_holding_days = st.selectbox(
-            "Hold each trade for",
-            [1, 3, 5, 10, 20],
-            index=2,
-            format_func=lambda value: (
-                f"{value} trading day"
-                if value == 1
-                else f"{value} trading days"
-            ),
-        )
-
-        backtest_minimum_quality = st.slider(
-            "Minimum setup quality required",
-            min_value=50,
-            max_value=90,
-            value=70,
-            step=5,
-        )
-
-        backtest_cost_bps = st.number_input(
-            "Estimated cost/slippage per side (basis points)",
-            min_value=0.0,
-            max_value=100.0,
-            value=5.0,
-            step=1.0,
-        )
-
-    analyze = st.form_submit_button("Analyze")
 
 
 if analyze:
@@ -1342,18 +2076,22 @@ if analyze:
         news_tab,
     ) = st.tabs(
         [
-            "Trade Setup",
-            "Backtesting Lab",
-            "Summary",
-            "Price Chart",
-            "Momentum Charts",
-            "Watchlist & Compare",
-            "News & Trending",
+            "Decision",
+            "Backtest",
+            "Snapshot",
+            "Chart",
+            "Momentum",
+            "Watchlist",
+            "News",
         ]
     )
 
     with trade_tab:
-        st.subheader(f"{ticker} simple trade setup")
+        st.subheader(f"Decision for {ticker}")
+        st.caption(
+            "Use this as a decision aid: trade only when the setup, "
+            "entry, risk, and current news all make sense together."
+        )
 
         bias_column, quality_column, status_column = st.columns(3)
 
@@ -1378,34 +2116,12 @@ if analyze:
             f"Directional score: **{direction_score:+d} out of 7**"
         )
 
-        quality_gauge = go.Figure(
-            go.Indicator(
-                mode="gauge+number",
-                value=trade_setup["setup_quality"],
-                title={
-                    "text": "Technical setup quality"
-                },
-                gauge={
-                    "axis": {
-                        "range": [0, 100]
-                    }
-                },
-            )
+        st.progress(
+            trade_setup["setup_quality"] / 100
         )
-
-        quality_gauge.update_layout(
-            height=320,
-            margin=dict(
-                l=20,
-                r=20,
-                t=60,
-                b=20,
-            ),
-        )
-
-        st.plotly_chart(
-            quality_gauge,
-            use_container_width=True,
+        st.caption(
+            "The bar measures technical signal agreement, not the "
+            "chance that a trade will make money."
         )
 
         if trade_setup["trade_status"] == "POTENTIAL TRADE SETUP":
@@ -1426,18 +2142,18 @@ if analyze:
         else:
             st.info(trade_setup["status_text"])
 
-        st.subheader("Why the dashboard gave this reading")
+        with st.expander("Why the dashboard gave this reading"):
+            for reason in trade_setup["evidence"]:
+                st.write(f"• {reason}")
 
-        for reason in trade_setup["evidence"]:
-            st.write(f"• {reason}")
-
-        st.subheader("Risk flags")
-
-        if trade_setup["risk_flags"]:
-            for warning in trade_setup["risk_flags"]:
-                st.write(f"• {warning}")
-        else:
-            st.write("• No major indicator-stretch warnings were detected.")
+        with st.expander("Risk flags"):
+            if trade_setup["risk_flags"]:
+                for warning in trade_setup["risk_flags"]:
+                    st.write(f"• {warning}")
+            else:
+                st.write(
+                    "• No major indicator-stretch warnings were detected."
+                )
 
         st.warning(
             "This score measures indicator agreement, not the probability "
@@ -1873,12 +2589,42 @@ if analyze:
             col=1,
         )
 
-        chart_lines = [
-            ("MA20", "20-Day Average"),
-            ("MA50", "50-Day Average"),
-            ("Upper Band", "Upper Bollinger Band"),
-            ("Lower Band", "Lower Bollinger Band"),
-        ]
+        selected_overlays = st.multiselect(
+            "Chart overlays",
+            [
+                "20-day average",
+                "50-day average",
+                "Bollinger Bands",
+            ],
+            default=[
+                "20-day average",
+                "50-day average",
+            ],
+            help=(
+                "Turn overlays on or off to keep the chart easier "
+                "to read."
+            ),
+        )
+
+        chart_lines = []
+
+        if "20-day average" in selected_overlays:
+            chart_lines.append(
+                ("MA20", "20-Day Average")
+            )
+
+        if "50-day average" in selected_overlays:
+            chart_lines.append(
+                ("MA50", "50-Day Average")
+            )
+
+        if "Bollinger Bands" in selected_overlays:
+            chart_lines.extend(
+                [
+                    ("Upper Band", "Upper Bollinger Band"),
+                    ("Lower Band", "Lower Bollinger Band"),
+                ]
+            )
 
         for column, name in chart_lines:
             price_chart.add_trace(
