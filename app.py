@@ -44,6 +44,12 @@ st.caption(
     "testing, entering, and tracking higher-quality trades."
 )
 
+if "analysis_ready" not in st.session_state:
+    st.session_state.analysis_ready = False
+
+if "analysis_entry_anchors" not in st.session_state:
+    st.session_state.analysis_entry_anchors = {}
+
 
 def save_auth_tokens(access_token, refresh_token):
     """Save Supabase tokens in Session State and encrypted browser cookies."""
@@ -211,33 +217,119 @@ def close_cloud_trade(client, trade_id, exit_price, notes=""):
     return response.data
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_latest_trade_price(ticker):
-    """Return Yahoo's latest available price, cached for 60 seconds."""
+@st.cache_data(ttl=30, show_spinner=False)
+def get_latest_quote(ticker):
+    """Return the latest Yahoo quote, prior close, and quote timestamp."""
     symbol = ticker.strip().upper()
     stock = yf.Ticker(symbol)
 
+    latest_price = None
+    previous_close = None
+    quote_timestamp = None
+
     try:
         fast_info = stock.fast_info
-        latest = fast_info.get("last_price")
-        if latest is not None and float(latest) > 0:
-            return float(latest)
+        fast_latest = fast_info.get("last_price")
+        fast_previous = fast_info.get("previous_close")
+
+        if fast_latest is not None and float(fast_latest) > 0:
+            latest_price = float(fast_latest)
+
+        if fast_previous is not None and float(fast_previous) > 0:
+            previous_close = float(fast_previous)
     except Exception:
         pass
 
-    intraday = stock.history(
-        period="5d",
-        interval="5m",
-        prepost=True,
-        auto_adjust=False,
-    )
+    intraday = pd.DataFrame()
 
-    intraday = intraday.dropna(subset=["Close"])
+    for period, interval in [("1d", "1m"), ("5d", "5m")]:
+        try:
+            intraday = stock.history(
+                period=period,
+                interval=interval,
+                prepost=True,
+                auto_adjust=False,
+            )
+            intraday = intraday.dropna(subset=["Close"])
+        except Exception:
+            intraday = pd.DataFrame()
 
-    if intraday.empty:
-        return None
+        if not intraday.empty:
+            break
 
-    return float(intraday["Close"].iloc[-1])
+    if not intraday.empty:
+        latest_price = float(intraday["Close"].iloc[-1])
+        quote_timestamp = pd.Timestamp(intraday.index[-1])
+
+    if latest_price is None or previous_close is None:
+        try:
+            daily = stock.history(
+                period="5d",
+                interval="1d",
+                auto_adjust=False,
+            ).dropna(subset=["Close"])
+
+            if latest_price is None and not daily.empty:
+                latest_price = float(daily["Close"].iloc[-1])
+
+            if previous_close is None:
+                if len(daily) >= 2:
+                    previous_close = float(daily["Close"].iloc[-2])
+                elif not daily.empty:
+                    previous_close = float(daily["Close"].iloc[-1])
+        except Exception:
+            pass
+
+    if latest_price is None:
+        return {
+            "price": None,
+            "previous_close": previous_close,
+            "change": None,
+            "change_percent": None,
+            "updated_at": None,
+        }
+
+    if quote_timestamp is not None:
+        try:
+            if quote_timestamp.tzinfo is None:
+                quote_timestamp = quote_timestamp.tz_localize(
+                    "America/New_York"
+                )
+            else:
+                quote_timestamp = quote_timestamp.tz_convert(
+                    "America/New_York"
+                )
+
+            updated_at = quote_timestamp.strftime(
+                "%b %d, %Y %I:%M:%S %p ET"
+            )
+        except Exception:
+            updated_at = None
+    else:
+        updated_at = datetime.now(
+            ZoneInfo("America/New_York")
+        ).strftime("%b %d, %Y %I:%M:%S %p ET")
+
+    if previous_close and previous_close > 0:
+        change = latest_price - previous_close
+        change_percent = (change / previous_close) * 100
+    else:
+        change = None
+        change_percent = None
+
+    return {
+        "price": float(latest_price),
+        "previous_close": previous_close,
+        "change": change,
+        "change_percent": change_percent,
+        "updated_at": updated_at,
+    }
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_latest_trade_price(ticker):
+    """Return the latest available price used by Active Trades."""
+    return get_latest_quote(ticker).get("price")
 
 
 def calculate_live_trade_metrics(trade, current_price):
@@ -305,6 +397,48 @@ def calculate_live_trade_metrics(trade, current_price):
         "target_distance": max(0.0, target_distance),
         "status": status,
         "status_kind": status_kind,
+    }
+
+
+def build_suggested_trade_plan(
+    ticker,
+    direction,
+    fallback_price,
+    atr_14,
+    reward_to_risk=2.0,
+    entry_price_override=None,
+):
+    """Build editable ATR-based entry, stop, and target placeholders."""
+    latest_price = (
+        entry_price_override
+        if entry_price_override is not None
+        else get_latest_trade_price(ticker)
+    )
+    entry_price = float(latest_price or fallback_price)
+
+    atr_value = float(atr_14) if atr_14 and atr_14 > 0 else 0.0
+    minimum_risk = max(entry_price * 0.005, 0.01)
+    risk_per_share = max(atr_value * 1.25, minimum_risk)
+
+    if direction == "LONG":
+        stop_price = max(0.01, entry_price - risk_per_share)
+        actual_risk = entry_price - stop_price
+        target_price = entry_price + (actual_risk * reward_to_risk)
+    else:
+        stop_price = entry_price + risk_per_share
+        actual_risk = stop_price - entry_price
+        target_price = max(
+            0.01,
+            entry_price - (actual_risk * reward_to_risk),
+        )
+
+    return {
+        "entry": round(entry_price, 2),
+        "stop": round(stop_price, 2),
+        "target": round(target_price, 2),
+        "risk_per_share": round(actual_risk, 2),
+        "reward_per_share": round(actual_risk * reward_to_risk, 2),
+        "reward_to_risk": reward_to_risk,
     }
 
 
@@ -466,6 +600,7 @@ with st.sidebar:
             "Refresh prices",
             use_container_width=True,
         ):
+            get_latest_quote.clear()
             get_latest_trade_price.clear()
             st.rerun()
 
@@ -580,6 +715,7 @@ with st.sidebar:
                                     float(exit_price),
                                     close_notes.strip(),
                                 )
+                                get_latest_quote.clear()
                                 get_latest_trade_price.clear()
                                 st.rerun()
                             except Exception as error:
@@ -677,6 +813,7 @@ with st.sidebar:
                             "target": float(trade_target),
                         },
                     )
+                    get_latest_quote.clear()
                     get_latest_trade_price.clear()
                     st.rerun()
                 except Exception as error:
@@ -1827,6 +1964,20 @@ with st.container(border=True):
 
 
 if analyze:
+    st.session_state.analysis_ready = True
+
+    try:
+        analyzed_quote = get_latest_quote(ticker)
+        analyzed_price = analyzed_quote.get("price")
+    except Exception:
+        analyzed_price = None
+
+    if analyzed_price is not None:
+        st.session_state.analysis_entry_anchors[ticker] = float(
+            analyzed_price
+        )
+
+if st.session_state.analysis_ready:
     if not ticker:
         st.error("Please enter a stock ticker.")
         st.stop()
@@ -1934,6 +2085,18 @@ if analyze:
         history["MACD"] - history["Signal"]
     )
 
+    previous_close = history["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            history["High"] - history["Low"],
+            (history["High"] - previous_close).abs(),
+            (history["Low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    history["ATR14"] = true_range.rolling(14).mean()
+
     latest = history.iloc[-1]
     previous = history.iloc[-2]
 
@@ -1959,6 +2122,10 @@ if analyze:
 
     upper_band = float(latest["Upper Band"])
     lower_band = float(latest["Lower Band"])
+
+    atr_14 = float(latest["ATR14"])
+    if math.isnan(atr_14) or atr_14 <= 0:
+        atr_14 = max(price * 0.02, 0.01)
 
     latest_volume = int(latest["Volume"])
 
@@ -2093,6 +2260,154 @@ if analyze:
             "entry, risk, and current news all make sense together."
         )
 
+        quote_title_column, quote_refresh_column = st.columns(
+            [4, 1]
+        )
+
+        quote_title_column.markdown("### Latest market price")
+
+        if quote_refresh_column.button(
+            "Refresh price",
+            key=f"refresh_decision_quote_{ticker}",
+            use_container_width=True,
+        ):
+            get_latest_quote.clear()
+            get_latest_trade_price.clear()
+            st.rerun()
+
+        try:
+            latest_quote = get_latest_quote(ticker)
+        except Exception:
+            latest_quote = {
+                "price": None,
+                "previous_close": None,
+                "change": None,
+                "change_percent": None,
+                "updated_at": None,
+            }
+
+        latest_market_price = latest_quote.get("price")
+        latest_change = latest_quote.get("change")
+        latest_change_percent = latest_quote.get("change_percent")
+
+        with st.container(border=True):
+            quote_metric_1, quote_metric_2, quote_metric_3 = st.columns(3)
+
+            if latest_market_price is None:
+                quote_metric_1.metric("Latest price", "Unavailable")
+            else:
+                quote_metric_1.metric(
+                    f"{ticker} latest price",
+                    f"${latest_market_price:,.2f}",
+                )
+
+            if (
+                latest_change is not None
+                and latest_change_percent is not None
+            ):
+                quote_metric_2.metric(
+                    "Change vs prior close",
+                    f"${latest_change:+.2f}",
+                    f"{latest_change_percent:+.2f}%",
+                )
+            else:
+                quote_metric_2.metric(
+                    "Change vs prior close",
+                    "Unavailable",
+                )
+
+            quote_metric_3.metric(
+                "Quote updated",
+                latest_quote.get("updated_at") or "Unavailable",
+            )
+
+            st.caption(
+                "Yahoo Finance estimate. Exchange data may be delayed. "
+                "The technical score below still uses daily indicator data."
+            )
+
+        suggested_direction = None
+        suggested_plan = None
+
+        if trade_setup["bias"] != "WAIT":
+            suggested_direction = (
+                "LONG"
+                if trade_setup["bias"] == "LONG BIAS"
+                else "SHORT"
+            )
+
+            entry_anchor = st.session_state.analysis_entry_anchors.get(
+                ticker
+            )
+
+            if entry_anchor is None:
+                entry_anchor = latest_market_price or price
+
+            suggested_plan = build_suggested_trade_plan(
+                ticker=ticker,
+                direction=suggested_direction,
+                fallback_price=price,
+                atr_14=atr_14,
+                entry_price_override=entry_anchor,
+            )
+
+            if latest_market_price is not None:
+                planned_entry = float(suggested_plan["entry"])
+                risk_per_share = max(
+                    float(suggested_plan["risk_per_share"]),
+                    0.01,
+                )
+
+                if suggested_direction == "LONG":
+                    movement_from_entry = (
+                        latest_market_price - planned_entry
+                    )
+                else:
+                    movement_from_entry = (
+                        planned_entry - latest_market_price
+                    )
+
+                movement_percent = (
+                    movement_from_entry / planned_entry
+                ) * 100
+                movement_in_r = movement_from_entry / risk_per_share
+
+                entry_distance_column_1, entry_distance_column_2 = (
+                    st.columns(2)
+                )
+                entry_distance_column_1.metric(
+                    "Planned entry",
+                    f"${planned_entry:.2f}",
+                )
+                entry_distance_column_2.metric(
+                    "Price vs planned entry",
+                    f"{movement_percent:+.2f}%",
+                    f"{movement_in_r:+.2f} R",
+                )
+
+                if movement_in_r >= 0.50:
+                    st.warning(
+                        "Price has moved materially beyond the planned "
+                        "entry. Avoid chasing without recalculating the "
+                        "stop, target, and reward-to-risk."
+                    )
+                elif movement_in_r >= 0.20:
+                    st.info(
+                        "Price has moved somewhat beyond the planned "
+                        "entry. Review the trade levels before entering."
+                    )
+                elif movement_in_r <= -0.50:
+                    st.warning(
+                        "Price is materially better than the planned entry, "
+                        "but verify that the setup has not weakened."
+                    )
+                else:
+                    st.success(
+                        "The latest price remains close to the planned entry."
+                    )
+
+        st.divider()
+
         bias_column, quality_column, status_column = st.columns(3)
 
         bias_column.metric(
@@ -2154,6 +2469,164 @@ if analyze:
                 st.write(
                     "• No major indicator-stretch warnings were detected."
                 )
+
+        st.divider()
+        st.subheader("Enter this analyzed trade")
+
+        if trade_setup["bias"] == "WAIT":
+            st.info(
+                "One-click entry is unavailable because the current "
+                "analysis does not have a clear long or short direction."
+            )
+        elif not logged_in:
+            st.info(
+                "Sign in from the sidebar to save this setup as an "
+                "active trade."
+            )
+        else:
+            if suggested_direction is None or suggested_plan is None:
+                suggested_direction = (
+                    "LONG"
+                    if trade_setup["bias"] == "LONG BIAS"
+                    else "SHORT"
+                )
+                suggested_plan = build_suggested_trade_plan(
+                    ticker=ticker,
+                    direction=suggested_direction,
+                    fallback_price=price,
+                    atr_14=atr_14,
+                    entry_price_override=(
+                        latest_market_price or price
+                    ),
+                )
+
+            if trade_setup["trade_status"] != "POTENTIAL TRADE SETUP":
+                st.warning(
+                    "This is a directional lean, not a fully confirmed "
+                    "setup. Review the levels and current news before "
+                    "recording an entry."
+                )
+
+            plan_metric_1, plan_metric_2, plan_metric_3 = st.columns(3)
+
+            plan_metric_1.metric(
+                "Suggested direction",
+                suggested_direction,
+            )
+            plan_metric_2.metric(
+                "Estimated entry",
+                f"${suggested_plan['entry']:.2f}",
+            )
+            plan_metric_3.metric(
+                "Default reward-to-risk",
+                f"{suggested_plan['reward_to_risk']:.1f} : 1",
+            )
+
+            st.caption(
+                "The default stop uses about 1.25 times the 14-day ATR. "
+                "The target is set at twice the dollars risked per share. "
+                "All fields remain editable so you can enter your actual fill."
+            )
+
+            with st.form(
+                f"decision_entry_form_{ticker}_{suggested_direction}"
+            ):
+                entry_column_1, entry_column_2 = st.columns(2)
+
+                with entry_column_1:
+                    decision_quantity = st.number_input(
+                        "Shares",
+                        min_value=1,
+                        value=1,
+                        step=1,
+                        key=f"decision_quantity_{ticker}",
+                    )
+
+                    decision_entry = st.number_input(
+                        "Actual or planned entry",
+                        min_value=0.01,
+                        value=float(suggested_plan["entry"]),
+                        step=0.01,
+                        format="%.2f",
+                        key=f"decision_entry_{ticker}",
+                    )
+
+                with entry_column_2:
+                    decision_stop = st.number_input(
+                        "Stop loss",
+                        min_value=0.01,
+                        value=float(suggested_plan["stop"]),
+                        step=0.01,
+                        format="%.2f",
+                        key=f"decision_stop_{ticker}",
+                    )
+
+                    decision_target = st.number_input(
+                        "Target price",
+                        min_value=0.01,
+                        value=float(suggested_plan["target"]),
+                        step=0.01,
+                        format="%.2f",
+                        key=f"decision_target_{ticker}",
+                    )
+
+                decision_add_clicked = st.form_submit_button(
+                    "Enter this trade",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if decision_add_clicked:
+                long_prices_invalid = (
+                    suggested_direction == "LONG"
+                    and not (
+                        decision_stop
+                        < decision_entry
+                        < decision_target
+                    )
+                )
+
+                short_prices_invalid = (
+                    suggested_direction == "SHORT"
+                    and not (
+                        decision_target
+                        < decision_entry
+                        < decision_stop
+                    )
+                )
+
+                if long_prices_invalid:
+                    st.error(
+                        "For a long trade, the stop must be below the "
+                        "entry and the target must be above it."
+                    )
+                elif short_prices_invalid:
+                    st.error(
+                        "For a short trade, the target must be below the "
+                        "entry and the stop must be above it."
+                    )
+                else:
+                    try:
+                        add_cloud_trade(
+                            supabase,
+                            st.session_state.supabase_user_id,
+                            {
+                                "ticker": ticker,
+                                "direction": suggested_direction,
+                                "quantity": int(decision_quantity),
+                                "entry": float(decision_entry),
+                                "stop": float(decision_stop),
+                                "target": float(decision_target),
+                            },
+                        )
+                        get_latest_quote.clear()
+                        get_latest_trade_price.clear()
+                        st.success(
+                            f"{ticker} was added to Active Trades."
+                        )
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Trade could not be saved: {error}")
 
         st.warning(
             "This score measures indicator agreement, not the probability "
