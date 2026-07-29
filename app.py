@@ -15,6 +15,7 @@ st.set_page_config(
     page_title="Folsom Trade Assistant",
     page_icon="📈",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 
@@ -41,7 +42,7 @@ st.title("📈 Folsom Trade Assistant")
 
 st.caption(
     "A beginner-friendly decision dashboard for finding, "
-    "testing, entering, and tracking higher-quality trades."
+    "testing, validating, entering, and tracking higher-quality trades."
 )
 
 if "analysis_ready" not in st.session_state:
@@ -146,10 +147,27 @@ def load_cloud_trades(client, user_id):
         client.table("trades")
         .select(
             "id,ticker,direction,entry_price,stop_price,"
-            "target_price,quantity,status,created_at"
+            "target_price,quantity,status,notes,created_at"
         )
         .eq("user_id", user_id)
         .eq("status", "ACTIVE")
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+    return response.data or []
+
+
+def load_pending_orders(client, user_id):
+    """Load paper limit orders that have not filled yet."""
+    response = (
+        client.table("trades")
+        .select(
+            "id,ticker,direction,entry_price,stop_price,"
+            "target_price,quantity,status,notes,created_at"
+        )
+        .eq("user_id", user_id)
+        .eq("status", "PENDING")
         .order("created_at", desc=False)
         .execute()
     )
@@ -178,23 +196,85 @@ def load_closed_trades(client, user_id, limit=20):
 
 def add_cloud_trade(client, user_id, trade):
     """Insert one active trade for the authenticated user."""
-    response = (
-        client.table("trades")
-        .insert(
-            {
-                "user_id": user_id,
-                "ticker": trade["ticker"],
-                "direction": trade["direction"],
-                "entry_price": trade["entry"],
-                "stop_price": trade["stop"],
-                "target_price": trade["target"],
-                "quantity": trade["quantity"],
-                "status": "ACTIVE",
-            }
-        )
-        .execute()
+    payload = {
+        "user_id": user_id,
+        "ticker": trade["ticker"],
+        "direction": trade["direction"],
+        "entry_price": trade["entry"],
+        "stop_price": trade["stop"],
+        "target_price": trade["target"],
+        "quantity": trade["quantity"],
+        "status": trade.get("status", "ACTIVE"),
+    }
+
+    if trade.get("notes"):
+        payload["notes"] = trade["notes"]
+
+    response = client.table("trades").insert(payload).execute()
+    return response.data
+
+
+def add_pending_paper_order(client, user_id, order):
+    """Save a recommended entry as a pending paper limit order."""
+    return add_cloud_trade(
+        client,
+        user_id,
+        {
+            **order,
+            "status": "PENDING",
+            "notes": "PAPER LIMIT ORDER | Waiting for recommended entry",
+        },
     )
 
+
+def entry_is_waiting(direction, entry_price, current_price):
+    """Return True when the proposed limit entry has not traded yet."""
+    if current_price is None:
+        return False
+
+    entry_price = float(entry_price)
+    current_price = float(current_price)
+    tolerance = max(0.01, entry_price * 0.001)
+
+    if str(direction).upper() == "LONG":
+        return current_price > entry_price + tolerance
+    return current_price < entry_price - tolerance
+
+
+def activate_pending_order(client, order_id):
+    """Convert a filled pending paper order into an active paper trade."""
+    detected_at = datetime.now(timezone.utc).isoformat()
+    response = (
+        client.table("trades")
+        .update(
+            {
+                "status": "ACTIVE",
+                "notes": (
+                    "PAPER TRADE | Pending limit entry was touched; "
+                    f"fill detected {detected_at}"
+                ),
+            }
+        )
+        .eq("id", order_id)
+        .execute()
+    )
+    return response.data
+
+
+def cancel_pending_order(client, order_id):
+    """Cancel a pending paper order without creating an active position."""
+    response = (
+        client.table("trades")
+        .update(
+            {
+                "status": "CANCELLED",
+                "notes": "PAPER LIMIT ORDER | Cancelled before fill",
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", order_id)
+        .execute()
+    )
     return response.data
 
 
@@ -332,6 +412,101 @@ def get_latest_trade_price(ticker):
     return get_latest_quote(ticker).get("price")
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def check_pending_limit_fill(ticker, direction, entry_price, created_at):
+    """Check whether a pending limit entry traded since the order was saved."""
+    symbol = ticker.strip().upper()
+    entry_price = float(entry_price)
+    direction = direction.upper()
+    created = pd.to_datetime(created_at, utc=True, errors="coerce")
+    current_price = None
+
+    try:
+        current_price = get_latest_trade_price(symbol)
+    except Exception:
+        current_price = None
+
+    touched = False
+    observed_low = None
+    observed_high = None
+
+    for period, interval in [("7d", "1m"), ("60d", "5m")]:
+        try:
+            bars = yf.Ticker(symbol).history(
+                period=period,
+                interval=interval,
+                prepost=True,
+                auto_adjust=False,
+            )
+            bars = bars.dropna(subset=["High", "Low"])
+        except Exception:
+            bars = pd.DataFrame()
+
+        if bars.empty:
+            continue
+
+        index = pd.DatetimeIndex(bars.index)
+        if index.tz is None:
+            index = index.tz_localize("UTC")
+        else:
+            index = index.tz_convert("UTC")
+        bars = bars.copy()
+        bars.index = index
+
+        if not pd.isna(created):
+            bars = bars.loc[bars.index >= created]
+        if bars.empty:
+            continue
+
+        observed_low = float(bars["Low"].min())
+        observed_high = float(bars["High"].max())
+        if direction == "LONG":
+            touched = observed_low <= entry_price
+        else:
+            touched = observed_high >= entry_price
+        break
+
+    if not touched and current_price is not None:
+        if direction == "LONG":
+            touched = float(current_price) <= entry_price
+        else:
+            touched = float(current_price) >= entry_price
+
+    return {
+        "filled": bool(touched),
+        "current_price": float(current_price) if current_price is not None else None,
+        "observed_low": observed_low,
+        "observed_high": observed_high,
+    }
+
+
+def sync_pending_orders(client, pending_orders):
+    """Activate pending paper orders whose entry price has been touched."""
+    filled = []
+    checks = {}
+
+    for order in pending_orders:
+        try:
+            check = check_pending_limit_fill(
+                order["ticker"],
+                order["direction"],
+                order["entry_price"],
+                order.get("created_at"),
+            )
+            checks[order["id"]] = check
+            if check["filled"]:
+                activate_pending_order(client, order["id"])
+                filled.append(order["ticker"])
+        except Exception as error:
+            checks[order["id"]] = {
+                "filled": False,
+                "current_price": None,
+                "error": str(error),
+            }
+
+    return filled, checks
+
+
 def calculate_live_trade_metrics(trade, current_price):
     """Calculate P/L, level distances, and an easy-to-read status."""
     entry_price = float(trade["entry_price"])
@@ -455,419 +630,6 @@ def calculate_closed_trade_result(trade):
 
     return pnl_per_share * quantity
 
-
-supabase, supabase_error = get_supabase_client()
-logged_in = bool(st.session_state.get("supabase_user_id"))
-
-with st.sidebar:
-    st.header("👤 Account")
-
-    if supabase_error:
-        st.error(supabase_error)
-        st.caption(
-            "Stock analysis still works, but cloud trade saving is disabled."
-        )
-
-    elif not logged_in:
-        sign_in_tab, create_account_tab = st.tabs(
-            ["Sign in", "Create account"]
-        )
-
-        with sign_in_tab:
-            with st.form("sign_in_form"):
-                sign_in_email = st.text_input(
-                    "Email",
-                    key="sign_in_email",
-                ).strip()
-
-                sign_in_password = st.text_input(
-                    "Password",
-                    type="password",
-                    key="sign_in_password",
-                )
-
-                sign_in_clicked = st.form_submit_button(
-                    "Sign in",
-                    use_container_width=True,
-                )
-
-            if sign_in_clicked:
-                if not sign_in_email or not sign_in_password:
-                    st.error("Enter your email and password.")
-                else:
-                    try:
-                        auth_response = (
-                            supabase.auth.sign_in_with_password(
-                                {
-                                    "email": sign_in_email,
-                                    "password": sign_in_password,
-                                }
-                            )
-                        )
-                        remember_auth_response(auth_response)
-                        st.rerun()
-                    except Exception as error:
-                        st.error(f"Sign-in failed: {error}")
-
-        with create_account_tab:
-            with st.form("create_account_form"):
-                create_email = st.text_input(
-                    "Email",
-                    key="create_email",
-                ).strip()
-
-                create_password = st.text_input(
-                    "Password",
-                    type="password",
-                    key="create_password",
-                )
-
-                create_password_again = st.text_input(
-                    "Confirm password",
-                    type="password",
-                    key="create_password_again",
-                )
-
-                create_clicked = st.form_submit_button(
-                    "Create account",
-                    use_container_width=True,
-                )
-
-            if create_clicked:
-                if not create_email or not create_password:
-                    st.error("Enter an email and password.")
-                elif create_password != create_password_again:
-                    st.error("The passwords do not match.")
-                elif len(create_password) < 8:
-                    st.error("Use a password with at least 8 characters.")
-                else:
-                    try:
-                        auth_response = supabase.auth.sign_up(
-                            {
-                                "email": create_email,
-                                "password": create_password,
-                            }
-                        )
-
-                        remember_auth_response(auth_response)
-
-                        if auth_response.session:
-                            st.rerun()
-                        else:
-                            st.success(
-                                "Account created. Check your email to "
-                                "confirm it, then return here and sign in."
-                            )
-                    except Exception as error:
-                        st.error(f"Account creation failed: {error}")
-
-        st.caption(
-            "Sign in once on each device. Encrypted browser cookies "
-            "restore your login after a refresh."
-        )
-
-    else:
-        user_email = st.session_state.get(
-            "supabase_user_email",
-            "Signed-in user",
-        )
-
-        st.success(f"Signed in as {user_email}")
-
-        if st.button(
-            "Sign out",
-            use_container_width=True,
-        ):
-            try:
-                supabase.auth.sign_out()
-            except Exception:
-                pass
-
-            clear_auth_state()
-            st.rerun()
-
-    st.divider()
-    st.header("📌 Active Trades")
-    st.caption("Prices are Yahoo Finance estimates and may be delayed.")
-
-    if not logged_in:
-        st.info("Sign in to save and sync active trades.")
-
-    else:
-        refresh_column, count_column = st.columns([1, 1])
-
-        if refresh_column.button(
-            "Refresh prices",
-            use_container_width=True,
-        ):
-            get_latest_quote.clear()
-            get_latest_trade_price.clear()
-            st.rerun()
-
-        try:
-            active_trades = load_cloud_trades(
-                supabase,
-                st.session_state.supabase_user_id,
-            )
-        except Exception as error:
-            active_trades = []
-            st.error(f"Cloud trades could not be loaded: {error}")
-
-        count_column.metric("Open", len(active_trades))
-
-        if active_trades:
-            for active_trade in active_trades:
-                entry_price = float(active_trade["entry_price"])
-                stop_price = float(active_trade["stop_price"])
-                target_price = float(active_trade["target_price"])
-                quantity = int(active_trade.get("quantity") or 1)
-                direction = active_trade["direction"]
-
-                try:
-                    current_price = get_latest_trade_price(
-                        active_trade["ticker"]
-                    )
-                except Exception:
-                    current_price = None
-
-                with st.container(border=True):
-                    st.markdown(
-                        f"### {active_trade['ticker']} — {direction}"
-                    )
-                    st.caption(f"{quantity} share(s)")
-
-                    if current_price is None:
-                        st.warning("Current price could not be loaded.")
-                        default_exit_price = entry_price
-                    else:
-                        metrics = calculate_live_trade_metrics(
-                            active_trade,
-                            current_price,
-                        )
-
-                        price_column, pnl_column = st.columns(2)
-
-                        price_column.metric(
-                            "Current",
-                            f"${current_price:,.2f}",
-                        )
-
-                        pnl_column.metric(
-                            "Unrealized P/L",
-                            f"${metrics['total_pnl']:+,.2f}",
-                            f"{metrics['pnl_percent']:+.2%}",
-                        )
-
-                        status_message = (
-                            f"{metrics['status']} — "
-                            f"${metrics['stop_distance']:.2f} from stop, "
-                            f"${metrics['target_distance']:.2f} from target."
-                        )
-
-                        if metrics["status_kind"] == "success":
-                            st.success(status_message)
-                        elif metrics["status_kind"] == "error":
-                            st.error(status_message)
-                        elif metrics["status_kind"] == "warning":
-                            st.warning(status_message)
-                        else:
-                            st.info(status_message)
-
-                        default_exit_price = current_price
-
-                    st.write(
-                        f"**Entry:** ${entry_price:.2f}  •  "
-                        f"**Stop:** ${stop_price:.2f}  •  "
-                        f"**Target:** ${target_price:.2f}"
-                    )
-
-                    with st.expander("Close this trade"):
-                        with st.form(
-                            f"close_trade_form_{active_trade['id']}"
-                        ):
-                            exit_price = st.number_input(
-                                "Exit price",
-                                min_value=0.01,
-                                value=float(default_exit_price),
-                                step=0.01,
-                                format="%.2f",
-                                key=f"exit_price_{active_trade['id']}",
-                            )
-
-                            close_notes = st.text_area(
-                                "Notes (optional)",
-                                key=f"close_notes_{active_trade['id']}",
-                                placeholder=(
-                                    "Why did you exit? What did you learn?"
-                                ),
-                            )
-
-                            close_clicked = st.form_submit_button(
-                                "Close and record trade",
-                                use_container_width=True,
-                            )
-
-                        if close_clicked:
-                            try:
-                                close_cloud_trade(
-                                    supabase,
-                                    active_trade["id"],
-                                    float(exit_price),
-                                    close_notes.strip(),
-                                )
-                                get_latest_quote.clear()
-                                get_latest_trade_price.clear()
-                                st.rerun()
-                            except Exception as error:
-                                st.error(f"Trade close failed: {error}")
-        else:
-            st.info("No active trades yet.")
-
-        st.divider()
-        st.subheader("Add a trade")
-
-        with st.form("add_trade_form", clear_on_submit=True):
-            trade_ticker = st.text_input(
-                "Ticker"
-            ).strip().upper()
-
-            trade_direction = st.selectbox(
-                "Direction",
-                ["LONG", "SHORT"],
-            )
-
-            trade_quantity = st.number_input(
-                "Shares",
-                min_value=1,
-                value=1,
-                step=1,
-            )
-
-            trade_entry = st.number_input(
-                "Entry price",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-            )
-
-            trade_stop = st.number_input(
-                "Stop loss",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-            )
-
-            trade_target = st.number_input(
-                "Target price",
-                min_value=0.0,
-                step=0.01,
-                format="%.2f",
-            )
-
-            add_trade_clicked = st.form_submit_button(
-                "Add active trade",
-                use_container_width=True,
-            )
-
-        if add_trade_clicked:
-            missing_required_value = (
-                not trade_ticker
-                or trade_entry <= 0
-                or trade_stop <= 0
-                or trade_target <= 0
-            )
-
-            long_prices_invalid = (
-                trade_direction == "LONG"
-                and not (trade_stop < trade_entry < trade_target)
-            )
-
-            short_prices_invalid = (
-                trade_direction == "SHORT"
-                and not (trade_target < trade_entry < trade_stop)
-            )
-
-            if missing_required_value:
-                st.error("Enter a ticker, entry, stop, and target.")
-            elif long_prices_invalid:
-                st.error(
-                    "For a long trade, the stop must be below "
-                    "the entry and the target must be above it."
-                )
-            elif short_prices_invalid:
-                st.error(
-                    "For a short trade, the target must be below "
-                    "the entry and the stop must be above it."
-                )
-            else:
-                try:
-                    add_cloud_trade(
-                        supabase,
-                        st.session_state.supabase_user_id,
-                        {
-                            "ticker": trade_ticker,
-                            "direction": trade_direction,
-                            "quantity": int(trade_quantity),
-                            "entry": float(trade_entry),
-                            "stop": float(trade_stop),
-                            "target": float(trade_target),
-                        },
-                    )
-                    get_latest_quote.clear()
-                    get_latest_trade_price.clear()
-                    st.rerun()
-                except Exception as error:
-                    st.error(f"Trade could not be saved: {error}")
-
-        try:
-            closed_trades = load_closed_trades(
-                supabase,
-                st.session_state.supabase_user_id,
-            )
-        except Exception as error:
-            closed_trades = []
-            st.error(f"Trade history could not be loaded: {error}")
-
-        if closed_trades:
-            with st.expander(
-                f"📚 Trade History ({len(closed_trades)})"
-            ):
-                realized_total = sum(
-                    calculate_closed_trade_result(trade)
-                    for trade in closed_trades
-                    if trade.get("exit_price") is not None
-                )
-
-                st.metric(
-                    "Realized P/L shown",
-                    f"${realized_total:+,.2f}",
-                )
-
-                history_rows = []
-
-                for trade in closed_trades:
-                    if trade.get("exit_price") is None:
-                        continue
-
-                    realized_pnl = calculate_closed_trade_result(trade)
-
-                    history_rows.append(
-                        {
-                            "Ticker": trade["ticker"],
-                            "Side": trade["direction"],
-                            "Shares": int(trade.get("quantity") or 1),
-                            "Entry": f"${float(trade['entry_price']):.2f}",
-                            "Exit": f"${float(trade['exit_price']):.2f}",
-                            "P/L": f"${realized_pnl:+.2f}",
-                        }
-                    )
-
-                if history_rows:
-                    st.dataframe(
-                        pd.DataFrame(history_rows),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
 
 
 def extract_number(value):
@@ -1395,85 +1157,46 @@ def calculate_trade_setup(
     }
 
 
+
 def add_backtest_indicators(data):
-    """Calculate the same indicators used by the current trade setup."""
+    """Calculate technical indicators using only information available at each close."""
     result = data.copy()
 
     result["MA20"] = result["Close"].rolling(20).mean()
     result["MA50"] = result["Close"].rolling(50).mean()
 
     standard_deviation = result["Close"].rolling(20).std()
-
-    result["Upper Band"] = (
-        result["MA20"] + (2 * standard_deviation)
-    )
-
-    result["Lower Band"] = (
-        result["MA20"] - (2 * standard_deviation)
-    )
+    result["Upper Band"] = result["MA20"] + (2 * standard_deviation)
+    result["Lower Band"] = result["MA20"] - (2 * standard_deviation)
 
     movement = result["Close"].diff()
-
-    average_gain = (
-        movement.clip(lower=0)
-        .rolling(14)
-        .mean()
-    )
-
-    average_loss = (
-        -movement.clip(upper=0)
-        .rolling(14)
-        .mean()
-    )
-
+    average_gain = movement.clip(lower=0).rolling(14).mean()
+    average_loss = (-movement.clip(upper=0)).rolling(14).mean()
     relative_strength = average_gain / average_loss
+    result["RSI"] = 100 - (100 / (1 + relative_strength))
+    result.loc[(average_gain == 0) & (average_loss == 0), "RSI"] = 50.0
+    result.loc[(average_gain > 0) & (average_loss == 0), "RSI"] = 100.0
+    result.loc[(average_gain == 0) & (average_loss > 0), "RSI"] = 0.0
 
-    result["RSI"] = 100 - (
-        100 / (1 + relative_strength)
-    )
-
-    result.loc[
-        (average_gain == 0) & (average_loss == 0),
-        "RSI",
-    ] = 50.0
-
-    result.loc[
-        (average_gain > 0) & (average_loss == 0),
-        "RSI",
-    ] = 100.0
-
-    result.loc[
-        (average_gain == 0) & (average_loss > 0),
-        "RSI",
-    ] = 0.0
-
-    ema_12 = result["Close"].ewm(
-        span=12,
-        adjust=False,
-    ).mean()
-
-    ema_26 = result["Close"].ewm(
-        span=26,
-        adjust=False,
-    ).mean()
-
+    ema_12 = result["Close"].ewm(span=12, adjust=False).mean()
+    ema_26 = result["Close"].ewm(span=26, adjust=False).mean()
     result["MACD"] = ema_12 - ema_26
+    result["Signal"] = result["MACD"].ewm(span=9, adjust=False).mean()
+    result["Histogram"] = result["MACD"] - result["Signal"]
+    result["Average Volume 20"] = result["Volume"].rolling(20).mean()
 
-    result["Signal"] = result["MACD"].ewm(
-        span=9,
-        adjust=False,
-    ).mean()
-
-    result["Histogram"] = (
-        result["MACD"] - result["Signal"]
-    )
-
-    result["Average Volume 20"] = (
-        result["Volume"].rolling(20).mean()
-    )
+    previous_close = result["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            result["High"] - result["Low"],
+            (result["High"] - previous_close).abs(),
+            (result["Low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    result["ATR14"] = true_range.rolling(14).mean()
 
     return result
-
 
 def remove_unfinished_daily_bar(data):
     """
@@ -1518,63 +1241,491 @@ def remove_unfinished_daily_bar(data):
     return data
 
 
-def run_strategy_backtest(
+
+AIRLINE_TICKERS = {
+    "AAL", "ALK", "DAL", "JBLU", "LUV", "UAL", "CPA",
+}
+
+ENERGY_TICKERS = {
+    "APA", "COP", "CVX", "DVN", "EOG", "FANG", "HES", "MPC",
+    "OXY", "PSX", "XOM", "SLB", "HAL", "BKR",
+}
+
+SEMICONDUCTOR_TICKERS = {
+    "NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "TXN", "AMAT",
+    "LRCX", "KLAC", "ASML", "TSM", "ARM", "MRVL", "ON", "MCHP",
+    "ADI", "NXPI", "MPWR", "SMCI",
+}
+
+BANK_TICKERS = {
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "USB", "PNC", "TFC",
+    "SCHW", "BK", "STT", "COF",
+}
+
+GOLD_MINER_TICKERS = {
+    "NEM", "GOLD", "AEM", "KGC", "AU", "GFI", "WPM", "FNV",
+}
+
+GROWTH_TECH_TICKERS = {
+    "AAPL", "MSFT", "AMZN", "META", "GOOGL", "GOOG", "NFLX",
+    "CRM", "ORCL", "ADBE", "NOW", "PLTR", "SNOW", "SHOP",
+}
+
+INDUSTRIAL_TICKERS = {
+    "BA", "CAT", "DE", "GE", "HON", "LMT", "RTX", "NOC", "UPS",
+    "FDX", "UNP", "CSX",
+}
+
+SECTOR_ETF_BY_SECTOR = {
+    "Technology": "XLK",
+    "Financial Services": "XLF",
+    "Financial": "XLF",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Healthcare": "XLV",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Communication Services": "XLC",
+    "Basic Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+}
+
+MACRO_SYMBOLS = {
+    "Oil": "CL=F",
+    "Gold": "GC=F",
+    "Natural Gas": "NG=F",
+    "Copper": "HG=F",
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "VIX": "^VIX",
+    "Dollar": "DX-Y.NYB",
+    "US10Y": "^TNX",
+    "JETS": "JETS",
+    "SMH": "SMH",
+    "XLF": "XLF",
+    "KRE": "KRE",
+    "XLE": "XLE",
+    "GDX": "GDX",
+    "XLK": "XLK",
+    "XLI": "XLI",
+    "XLV": "XLV",
+    "XLY": "XLY",
+    "XLP": "XLP",
+    "XLC": "XLC",
+    "XLB": "XLB",
+    "XLRE": "XLRE",
+    "XLU": "XLU",
+}
+
+
+def normalize_market_dates(index):
+    """Convert market timestamps into timezone-naive Eastern calendar dates."""
+    normalized = pd.DatetimeIndex(pd.to_datetime(index))
+
+    if normalized.tz is not None:
+        normalized = (
+            normalized
+            .tz_convert("America/New_York")
+            .tz_localize(None)
+        )
+
+    return normalized.normalize()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_ticker_company_profile(ticker):
+    """Detect sector, industry, and a practical macro relationship profile."""
+    symbol = ticker.strip().upper()
+    sector = "Unknown"
+    industry = "Unknown"
+
+    try:
+        info = yf.Ticker(symbol).get_info()
+        sector = str(info.get("sector") or "Unknown")
+        industry = str(info.get("industry") or "Unknown")
+    except Exception:
+        pass
+
+    combined = f"{sector} {industry}".lower()
+
+    if symbol in AIRLINE_TICKERS or "airline" in combined:
+        profile = "Airline"
+    elif symbol in SEMICONDUCTOR_TICKERS or "semiconductor" in combined:
+        profile = "Semiconductor"
+    elif symbol in GOLD_MINER_TICKERS or (
+        "gold" in combined and ("mining" in combined or "miner" in combined)
+    ):
+        profile = "Gold miner"
+    elif symbol in ENERGY_TICKERS or sector == "Energy":
+        profile = "Energy"
+    elif symbol in BANK_TICKERS or "bank" in combined:
+        profile = "Bank"
+    elif symbol in INDUSTRIAL_TICKERS or sector == "Industrials":
+        profile = "Industrial"
+    elif symbol in GROWTH_TECH_TICKERS or sector == "Technology":
+        profile = "Growth / technology"
+    else:
+        profile = "General market"
+
+    sector_etf = SECTOR_ETF_BY_SECTOR.get(sector)
+
+    return {
+        "ticker": symbol,
+        "sector": sector,
+        "industry": industry,
+        "profile": profile,
+        "sector_etf": sector_etf,
+    }
+
+
+def resolve_ticker_macro_profile(ticker, selected_profile):
+    """Return detected company context, allowing a manual profile override."""
+    classification = get_ticker_company_profile(ticker).copy()
+    if selected_profile != "Auto by ticker":
+        classification["profile"] = selected_profile
+    return classification
+
+
+def _factor(
+    key,
+    label,
+    mode,
+    bullish_when,
+    weight,
+    relevance,
+    threshold,
+    reason,
+):
+    return {
+        "key": key,
+        "label": label,
+        "mode": mode,
+        "bullish_when": bullish_when,
+        "weight": int(weight),
+        "relevance": relevance,
+        "threshold": float(threshold),
+        "reason": reason,
+    }
+
+
+def build_ticker_factor_plan(classification, oil_threshold=0.02):
+    """Build a ticker-aware factor list while still observing broad context."""
+    profile = classification["profile"]
+    sector_etf = classification.get("sector_etf")
+
+    factors = [
+        _factor(
+            "SPY", "Broad market trend", "trend", "up", 2, "High", 0,
+            "Most stocks trade better when the broad market trend agrees.",
+        ),
+        _factor(
+            "VIX", "Market volatility", "return", "down", 1, "Moderate", 0.10,
+            "Falling volatility generally supports risk-taking; sharp rises add stress.",
+        ),
+    ]
+
+    if profile == "Airline":
+        factors += [
+            _factor("JETS", "Airline sector", "trend", "up", 3, "Very high", 0,
+                    "Airline-sector strength is a direct peer confirmation."),
+            _factor("Oil", "Oil / fuel cost", "return", "down", 3, "Very high", oil_threshold,
+                    "Lower fuel costs can support airline margins; sharp oil rises can pressure them."),
+            _factor("Dollar", "U.S. dollar", "return", "down", 1, "Moderate", 0.015,
+                    "Large dollar moves can affect international demand and costs."),
+        ]
+    elif profile == "Semiconductor":
+        factors += [
+            _factor("SMH", "Semiconductor sector", "trend", "up", 3, "Very high", 0,
+                    "Chip-sector strength is more relevant than unrelated commodities."),
+            _factor("QQQ", "Nasdaq growth trend", "trend", "up", 2, "High", 0,
+                    "Semiconductors are strongly tied to growth-stock risk appetite."),
+            _factor("US10Y", "10-year Treasury yield", "change", "down", 2, "High", 1.0,
+                    "Rapidly rising yields can pressure high-duration growth valuations."),
+            _factor("Dollar", "U.S. dollar", "return", "down", 1, "Moderate", 0.015,
+                    "A stronger dollar can weigh on multinational revenue translation."),
+        ]
+    elif profile == "Bank":
+        factors += [
+            _factor("XLF", "Financial sector", "trend", "up", 3, "Very high", 0,
+                    "Financial-sector confirmation is a direct peer signal."),
+            _factor("KRE", "Regional bank trend", "trend", "up", 2, "High", 0,
+                    "Regional-bank strength helps reveal banking-system risk appetite."),
+            _factor("US10Y", "10-year Treasury yield", "change", "up", 2, "High", 1.0,
+                    "Rate changes can affect lending margins, although the relationship is not always linear."),
+        ]
+    elif profile == "Energy":
+        factors += [
+            _factor("XLE", "Energy sector", "trend", "up", 3, "Very high", 0,
+                    "Energy-sector strength is the closest peer confirmation."),
+            _factor("Oil", "Oil price", "return", "up", 3, "Very high", oil_threshold,
+                    "Higher oil generally supports producers; sharp declines can pressure them."),
+            _factor("Natural Gas", "Natural gas", "return", "up", 1, "Moderate", 0.04,
+                    "Natural-gas sensitivity matters for many diversified energy companies."),
+            _factor("Dollar", "U.S. dollar", "return", "down", 1, "Moderate", 0.015,
+                    "A stronger dollar can pressure dollar-priced commodities."),
+        ]
+    elif profile == "Gold miner":
+        factors += [
+            _factor("GDX", "Gold-miner sector", "trend", "up", 3, "Very high", 0,
+                    "Gold-miner peer strength is a direct confirmation."),
+            _factor("Gold", "Gold price", "return", "up", 3, "Very high", 0.02,
+                    "Gold prices are a primary revenue driver for miners."),
+            _factor("Dollar", "U.S. dollar", "return", "down", 2, "High", 0.015,
+                    "Gold often faces pressure from a sharply stronger dollar."),
+            _factor("US10Y", "10-year Treasury yield", "change", "down", 1, "Moderate", 1.0,
+                    "Rising yields can compete with non-yielding gold."),
+        ]
+    elif profile == "Industrial":
+        factors += [
+            _factor("XLI", "Industrial sector", "trend", "up", 3, "Very high", 0,
+                    "Industrial-sector strength is a direct peer confirmation."),
+            _factor("Copper", "Copper / growth demand", "return", "up", 1, "Moderate", 0.02,
+                    "Copper can reflect global industrial demand and economic expectations."),
+            _factor("Dollar", "U.S. dollar", "return", "down", 1, "Moderate", 0.015,
+                    "A strong dollar can pressure multinational industrial revenue."),
+        ]
+    elif profile == "Growth / technology":
+        factors += [
+            _factor("QQQ", "Nasdaq growth trend", "trend", "up", 3, "Very high", 0,
+                    "Growth-stock risk appetite is a major technology driver."),
+            _factor("XLK", "Technology sector", "trend", "up", 2, "High", 0,
+                    "Technology-sector strength provides direct peer confirmation."),
+            _factor("US10Y", "10-year Treasury yield", "change", "down", 2, "High", 1.0,
+                    "Rapidly rising yields can pressure growth valuations."),
+            _factor("Dollar", "U.S. dollar", "return", "down", 1, "Moderate", 0.015,
+                    "A stronger dollar can weigh on multinational earnings translation."),
+        ]
+    elif sector_etf and sector_etf != "SPY":
+        factors.append(
+            _factor(
+                sector_etf,
+                f"{classification.get('sector', 'Sector')} trend",
+                "trend", "up", 3, "Very high", 0,
+                "The company's sector trend is its most relevant peer comparison.",
+            )
+        )
+
+    # Keep the broad picture visible without forcing unrelated factors into the score.
+    observed_only = [
+        _factor("QQQ", "Nasdaq trend", "trend", "up", 0, "Low", 0,
+                "Observed for context but not used in this profile's score."),
+        _factor("US10Y", "10-year Treasury yield", "change", "down", 0, "Low", 1.0,
+                "Observed for context but not used in this profile's score."),
+        _factor("Dollar", "U.S. dollar", "return", "down", 0, "Low", 0.015,
+                "Observed for context but not used in this profile's score."),
+        _factor("Oil", "Oil price", "return", "up", 0, "Low", oil_threshold,
+                "Observed for context but not used in this profile's score."),
+        _factor("Gold", "Gold price", "return", "up", 0, "Low", 0.02,
+                "Observed for context but not used in this profile's score."),
+    ]
+
+    by_key = {factor["key"]: factor for factor in factors}
+    for factor in observed_only:
+        by_key.setdefault(factor["key"], factor)
+
+    return list(by_key.values())
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_macro_history(start_date, requested_labels=()):
+    """Download only the macro/sector histories required by the factor plan."""
+    labels = tuple(requested_labels) or tuple(MACRO_SYMBOLS)
+    series = {}
+
+    for label in labels:
+        symbol = MACRO_SYMBOLS.get(label)
+        if not symbol:
+            continue
+        try:
+            history = yf.Ticker(symbol).history(
+                start=start_date,
+                auto_adjust=True,
+            )
+        except Exception:
+            history = pd.DataFrame()
+
+        if history.empty or "Close" not in history:
+            continue
+
+        close = history["Close"].dropna().astype(float)
+        close.index = normalize_market_dates(close.index)
+        close = close[~close.index.duplicated(keep="last")]
+        series[label] = close
+
+    if not series:
+        return pd.DataFrame()
+
+    return pd.concat(series, axis=1).sort_index().ffill()
+
+
+def build_macro_context(macro_history, lookback_days=5):
+    """Create comparable returns, trends, and yield-change features."""
+    if macro_history.empty:
+        return pd.DataFrame()
+
+    context = macro_history.copy().sort_index()
+
+    for label in macro_history.columns:
+        if label == "US10Y":
+            context["US10Y Change"] = context[label].diff(lookback_days)
+        else:
+            context[f"{label} Return"] = context[label].pct_change(lookback_days)
+
+        context[f"{label} MA50"] = context[label].rolling(50).mean()
+        context[f"{label} Above MA50"] = context[label] > context[f"{label} MA50"]
+
+    return context
+
+
+def factor_required_column(factor):
+    if factor["mode"] == "trend":
+        return f"{factor['key']} Above MA50"
+    if factor["mode"] == "change":
+        return f"{factor['key']} Change"
+    return f"{factor['key']} Return"
+
+
+def evaluate_macro_factor(row, factor):
+    """Evaluate one factor as bullish, bearish, neutral, or observed-only."""
+    column = factor_required_column(factor)
+    value = row.get(column)
+    weight = int(factor["weight"])
+
+    if pd.isna(value):
+        return 0, "Unavailable", "—", f"{factor['label']} was unavailable."
+
+    if factor["mode"] == "trend":
+        direction = "up" if bool(value) else "down"
+        reading = "Above MA50" if bool(value) else "Below MA50"
+        crossed = True
+    else:
+        numeric_value = float(value)
+        reading = f"{numeric_value:+.1%}" if factor["mode"] == "return" else f"{numeric_value:+.2f}"
+        if abs(numeric_value) < factor["threshold"]:
+            direction = "neutral"
+            crossed = False
+        else:
+            direction = "up" if numeric_value > 0 else "down"
+            crossed = True
+
+    if weight == 0:
+        return 0, "Not used", reading, f"{factor['label']} is observed but excluded from this ticker's score."
+
+    if not crossed or direction == "neutral":
+        return 0, "Neutral", reading, f"{factor['label']} did not make a meaningful move."
+
+    supportive = direction == factor["bullish_when"]
+    score = weight if supportive else -weight
+    effect = "Supportive" if supportive else "Negative"
+    evidence = f"{factor['label']} was {effect.lower()} ({reading})."
+    return score, effect, reading, evidence
+
+
+def calculate_macro_context_score(row, factor_plan):
+    """Return a bullish-to-bearish score using only relevant ticker factors."""
+    total_score = 0
+    evidence = []
+
+    for factor in factor_plan:
+        score, effect, reading, note = evaluate_macro_factor(row, factor)
+        total_score += score
+        if factor["weight"] > 0 and effect != "Neutral":
+            evidence.append(note)
+
+    if not evidence:
+        evidence.append("No relevant macro factor produced a strong directional signal.")
+
+    return total_score, evidence
+
+
+def build_current_factor_table(macro_context, factor_plan):
+    """Create a readable current factor table and current weighted score."""
+    columns = ["Factor", "Relevance", "Current effect", "Reading", "Weight", "Why it matters"]
+    if macro_context.empty:
+        return pd.DataFrame(columns=columns), 0
+
+    latest = macro_context.dropna(how="all").iloc[-1]
+    rows = []
+    total_score = 0
+
+    for factor in factor_plan:
+        score, effect, reading, _ = evaluate_macro_factor(latest, factor)
+        total_score += score
+        rows.append(
+            {
+                "Factor": factor["label"],
+                "Relevance": factor["relevance"],
+                "Current effect": effect,
+                "Reading": reading,
+                "Weight": factor["weight"] if factor["weight"] else "Ignored",
+                "Why it matters": factor["reason"],
+            }
+        )
+
+    relevance_order = {"Very high": 0, "High": 1, "Moderate": 2, "Low": 3}
+    table = pd.DataFrame(rows)
+    table["_order"] = table["Relevance"].map(relevance_order).fillna(9)
+    table = table.sort_values(["_order", "Factor"]).drop(columns="_order")
+    return table, total_score
+
+
+def attach_macro_context(prepared, macro_context):
+    """Join macro features to stock sessions using each session's date."""
+    result = prepared.copy()
+    result["_Macro Date"] = normalize_market_dates(result.index)
+
+    context = macro_context.copy()
+    context.index = normalize_market_dates(context.index)
+    context = context[
+        ~context.index.duplicated(keep="last")
+    ]
+
+    return result.join(
+        context,
+        on="_Macro Date",
+        how="left",
+    )
+
+
+
+def run_macro_strategy_backtest(
     data,
+    macro_context,
     test_start_date,
     holding_days,
     minimum_quality,
     cost_bps_per_side,
+    factor_plan,
+    minimum_macro_score,
+    stop_atr_multiple=1.25,
+    reward_to_risk=2.0,
 ):
-    """
-    Backtest the dashboard's long/short setup without look-ahead bias.
-
-    A signal is calculated after a daily close. A qualifying position
-    enters at the next session's open and exits at the close after the
-    selected number of trading sessions. Only one position is open at
-    a time.
-    """
+    """Run technical signals only when ticker-relevant macro context agrees."""
     prepared = remove_unfinished_daily_bar(data)
-
-    prepared = prepared.dropna(
-        subset=[
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-        ]
-    )
-
+    prepared = prepared.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
     prepared = add_backtest_indicators(prepared)
+    prepared = attach_macro_context(prepared, macro_context)
 
     required_columns = [
-        "Open",
-        "Close",
-        "MA20",
-        "MA50",
-        "RSI",
-        "MACD",
-        "Signal",
-        "Histogram",
-        "Upper Band",
-        "Lower Band",
-        "Average Volume 20",
+        "Open", "High", "Low", "Close", "MA20", "MA50", "RSI", "MACD",
+        "Signal", "Histogram", "Upper Band", "Lower Band",
+        "Average Volume 20", "ATR14",
     ]
-
-    prepared = prepared.dropna(
-        subset=required_columns
-    )
+    required_columns += [
+        factor_required_column(factor)
+        for factor in factor_plan
+        if factor["weight"] > 0
+    ]
+    prepared = prepared.dropna(subset=list(dict.fromkeys(required_columns)))
 
     trades = []
     index_position = 1
 
-    while index_position < len(prepared) - holding_days:
+    while index_position < len(prepared) - 1:
         signal_row = prepared.iloc[index_position]
         previous_row = prepared.iloc[index_position - 1]
-
-        signal_date = pd.Timestamp(
-            prepared.index[index_position]
-        )
+        signal_date = pd.Timestamp(prepared.index[index_position])
 
         if signal_date.date() < test_start_date:
             index_position += 1
@@ -1589,37 +1740,140 @@ def run_strategy_backtest(
             macd=float(signal_row["MACD"]),
             signal=float(signal_row["Signal"]),
             histogram=float(signal_row["Histogram"]),
-            previous_histogram=float(
-                previous_row["Histogram"]
-            ),
+            previous_histogram=float(previous_row["Histogram"]),
             upper_band=float(signal_row["Upper Band"]),
             lower_band=float(signal_row["Lower Band"]),
             latest_volume=int(signal_row["Volume"]),
-            average_volume_20=float(
-                signal_row["Average Volume 20"]
-            ),
+            average_volume_20=float(signal_row["Average Volume 20"]),
         )
 
-        qualifying_direction = setup["bias"] in (
-            "LONG BIAS",
-            "SHORT BIAS",
-        )
+        if setup["bias"] not in ("LONG BIAS", "SHORT BIAS"):
+            index_position += 1
+            continue
+        if setup["setup_quality"] < minimum_quality:
+            index_position += 1
+            continue
 
-        qualifying_quality = (
-            setup["setup_quality"] >= minimum_quality
+        direction = "LONG" if setup["bias"] == "LONG BIAS" else "SHORT"
+        macro_score, macro_evidence = calculate_macro_context_score(signal_row, factor_plan)
+        macro_confirms = (
+            macro_score >= minimum_macro_score
+            if direction == "LONG"
+            else macro_score <= -minimum_macro_score
         )
-
-        if not (
-            qualifying_direction
-            and qualifying_quality
-        ):
+        if not macro_confirms:
             index_position += 1
             continue
 
         entry_position = index_position + 1
-        exit_position = (
-            entry_position + holding_days - 1
+        if entry_position >= len(prepared):
+            break
+        entry_price = float(prepared["Open"].iloc[entry_position])
+        if entry_price <= 0:
+            index_position += 1
+            continue
+
+        simulated = simulate_atr_trade_exit(
+            prepared=prepared,
+            entry_position=entry_position,
+            maximum_holding_days=holding_days,
+            direction=direction,
+            entry_price=entry_price,
+            atr_at_signal=float(signal_row["ATR14"]),
+            stop_atr_multiple=stop_atr_multiple,
+            reward_to_risk=reward_to_risk,
         )
+        exit_position = simulated["exit_position"]
+        exit_price = simulated["exit_price"]
+        gross_return = (
+            (exit_price / entry_price) - 1
+            if direction == "LONG"
+            else (entry_price / exit_price) - 1
+        )
+        net_return = gross_return - (2 * cost_bps_per_side / 10000)
+
+        trades.append(
+            {
+                "Signal Date": signal_date,
+                "Entry Date": pd.Timestamp(prepared.index[entry_position]),
+                "Exit Date": pd.Timestamp(prepared.index[exit_position]),
+                "Direction": direction,
+                "Setup Quality": int(setup["setup_quality"]),
+                "Direction Score": int(setup["direction_score"]),
+                "Macro Score": int(macro_score),
+                "Macro Evidence": " ".join(macro_evidence),
+                "Entry Price": entry_price,
+                "Stop Price": simulated["stop_price"],
+                "Target Price": simulated["target_price"],
+                "Exit Price": exit_price,
+                "Exit Reason": simulated["exit_reason"],
+                "Gross Return": gross_return,
+                "Net Return": net_return,
+                "Winner": net_return > 0,
+                "Holding Sessions": int(exit_position - entry_position + 1),
+            }
+        )
+        index_position = exit_position + 1
+
+    return pd.DataFrame(trades), prepared
+
+def run_oil_shock_study(
+    data,
+    macro_context,
+    test_start_date,
+    holding_days,
+    cost_bps_per_side,
+    oil_threshold,
+    study_mode,
+):
+    """
+    Test the direct hypothesis of buying after oil drops or shorting after spikes.
+    """
+    prepared = remove_unfinished_daily_bar(data)
+
+    prepared = prepared.dropna(
+        subset=["Open", "High", "Low", "Close", "Volume"]
+    )
+
+    prepared = attach_macro_context(
+        prepared,
+        macro_context,
+    ).dropna(subset=["Oil Return"])
+
+    trades = []
+    index_position = 0
+
+    while index_position < len(prepared) - holding_days:
+        signal_row = prepared.iloc[index_position]
+        signal_date = pd.Timestamp(
+            prepared.index[index_position]
+        )
+
+        if signal_date.date() < test_start_date:
+            index_position += 1
+            continue
+
+        oil_move = float(signal_row["Oil Return"])
+
+        if study_mode == "Long stock after oil drop":
+            qualifies = oil_move <= -oil_threshold
+            direction = "LONG"
+        elif study_mode == "Long stock after oil spike":
+            qualifies = oil_move >= oil_threshold
+            direction = "LONG"
+        elif study_mode == "Short stock after oil drop":
+            qualifies = oil_move <= -oil_threshold
+            direction = "SHORT"
+        else:
+            qualifies = oil_move >= oil_threshold
+            direction = "SHORT"
+
+        if not qualifies:
+            index_position += 1
+            continue
+
+        entry_position = index_position + 1
+        exit_position = entry_position + holding_days - 1
 
         if exit_position >= len(prepared):
             break
@@ -1627,7 +1881,6 @@ def run_strategy_backtest(
         entry_price = float(
             prepared["Open"].iloc[entry_position]
         )
-
         exit_price = float(
             prepared["Close"].iloc[exit_position]
         )
@@ -1636,26 +1889,14 @@ def run_strategy_backtest(
             index_position += 1
             continue
 
-        direction = (
-            "LONG"
-            if setup["bias"] == "LONG BIAS"
-            else "SHORT"
-        )
-
         if direction == "LONG":
-            gross_return = (
-                exit_price / entry_price
-            ) - 1
+            gross_return = (exit_price / entry_price) - 1
         else:
-            gross_return = (
-                entry_price / exit_price
-            ) - 1
+            gross_return = (entry_price / exit_price) - 1
 
-        round_trip_cost = (
+        net_return = gross_return - (
             2 * cost_bps_per_side / 10000
         )
-
-        net_return = gross_return - round_trip_cost
 
         trades.append(
             {
@@ -1667,12 +1908,7 @@ def run_strategy_backtest(
                     prepared.index[exit_position]
                 ),
                 "Direction": direction,
-                "Setup Quality": int(
-                    setup["setup_quality"]
-                ),
-                "Direction Score": int(
-                    setup["direction_score"]
-                ),
+                "Oil Move": oil_move,
                 "Entry Price": entry_price,
                 "Exit Price": exit_price,
                 "Gross Return": gross_return,
@@ -1681,111 +1917,505 @@ def run_strategy_backtest(
             }
         )
 
-        # Do not allow overlapping positions.
         index_position = exit_position + 1
 
-    trades_frame = pd.DataFrame(trades)
-
-    return trades_frame, prepared
+    return pd.DataFrame(trades), prepared
 
 
-def calculate_backtest_statistics(
-    trades,
-    prepared_history,
+def format_macro_trade_table(trades):
+    """Format recent macro-confirmed trades for display."""
+    if trades.empty:
+        return trades
+
+    display = trades.copy()
+
+    for column in ["Signal Date", "Entry Date", "Exit Date"]:
+        display[column] = pd.to_datetime(
+            display[column]
+        ).dt.strftime("%Y-%m-%d")
+
+    for column in ["Oil Move", "Gold Move", "VIX Move"]:
+        if column in display:
+            display[column] = display[column].map(
+                lambda value: (
+                    f"{value:+.1%}"
+                    if pd.notna(value)
+                    else "—"
+                )
+            )
+
+    display["Net Return"] = display["Net Return"].map(
+        lambda value: f"{value:+.2%}"
+    )
+
+    return display[
+        [
+            "Signal Date",
+            "Direction",
+            "Setup Quality",
+            "Macro Score",
+            "Oil Move",
+            "Gold Move",
+            "SPY Regime",
+            "VIX Move",
+            "Net Return",
+        ]
+    ]
+
+
+def format_oil_study_table(trades):
+    """Format recent oil-shock study trades."""
+    if trades.empty:
+        return trades
+
+    display = trades.copy()
+
+    for column in ["Signal Date", "Entry Date", "Exit Date"]:
+        display[column] = pd.to_datetime(
+            display[column]
+        ).dt.strftime("%Y-%m-%d")
+
+    display["Oil Move"] = display["Oil Move"].map(
+        lambda value: f"{value:+.1%}"
+    )
+    display["Entry Price"] = display["Entry Price"].map(
+        lambda value: f"${value:,.2f}"
+    )
+    display["Exit Price"] = display["Exit Price"].map(
+        lambda value: f"${value:,.2f}"
+    )
+    display["Net Return"] = display["Net Return"].map(
+        lambda value: f"{value:+.2%}"
+    )
+
+    return display[
+        [
+            "Signal Date",
+            "Entry Date",
+            "Exit Date",
+            "Direction",
+            "Oil Move",
+            "Entry Price",
+            "Exit Price",
+            "Net Return",
+        ]
+    ]
+
+
+
+def build_strategy_comparison_row(label, statistics):
+    """Return one decision-useful comparison row for a completed backtest."""
+    if statistics is None:
+        return {
+            "Strategy": label,
+            "Edge grade": "No data",
+            "Trades": 0,
+            "Win rate": "—",
+            "Average trade": "—",
+            "Profit factor": "—",
+            "Out-of-sample": "—",
+            "Compounded return": "—",
+            "Exposure": "—",
+            "Max drawdown": "—",
+        }
+
+    oos = statistics.get("out_of_sample") or {}
+    pf = statistics["profit_factor"]
+    pf_text = "∞" if math.isinf(pf) else f"{pf:.2f}"
+    oos_pf = oos.get("profit_factor")
+    oos_text = (
+        f"{int(oos.get('trades', 0))} trades • {float(oos.get('average_return', 0)):+.2%} avg"
+        if oos
+        else "—"
+    )
+
+    return {
+        "Strategy": label,
+        "Edge grade": statistics["edge"]["label"],
+        "Trades": statistics["total_trades"],
+        "Win rate": f"{statistics['win_rate']:.1%}",
+        "Average trade": f"{statistics['average_return']:+.2%}",
+        "Profit factor": pf_text,
+        "Out-of-sample": oos_text,
+        "Compounded return": f"{statistics['total_return']:+.1%}",
+        "Exposure": f"{statistics['exposure']:.0%}",
+        "Max drawdown": f"{statistics['max_drawdown']:.1%}",
+    }
+
+def simulate_atr_trade_exit(
+    prepared,
+    entry_position,
+    maximum_holding_days,
+    direction,
+    entry_price,
+    atr_at_signal,
+    stop_atr_multiple=1.25,
+    reward_to_risk=2.0,
 ):
-    """Calculate summary statistics and a comparison equity curve."""
+    """
+    Simulate a trade using known-at-entry ATR risk levels.
+
+    Daily OHLC data cannot reveal which level was touched first when both the
+    stop and target occur in the same candle. The conservative assumption is
+    that the stop was hit first.
+    """
+    atr_value = max(float(atr_at_signal), entry_price * 0.005, 0.01)
+    risk_per_share = max(atr_value * stop_atr_multiple, entry_price * 0.005, 0.01)
+
+    if direction == "LONG":
+        stop_price = max(0.01, entry_price - risk_per_share)
+        target_price = entry_price + (entry_price - stop_price) * reward_to_risk
+    else:
+        stop_price = entry_price + risk_per_share
+        target_price = max(0.01, entry_price - (stop_price - entry_price) * reward_to_risk)
+
+    final_position = min(
+        entry_position + maximum_holding_days - 1,
+        len(prepared) - 1,
+    )
+    exit_position = final_position
+    exit_price = float(prepared["Close"].iloc[final_position])
+    exit_reason = "TIME EXIT"
+
+    for position in range(entry_position, final_position + 1):
+        day_high = float(prepared["High"].iloc[position])
+        day_low = float(prepared["Low"].iloc[position])
+
+        if direction == "LONG":
+            stop_touched = day_low <= stop_price
+            target_touched = day_high >= target_price
+        else:
+            stop_touched = day_high >= stop_price
+            target_touched = day_low <= target_price
+
+        if stop_touched and target_touched:
+            exit_position = position
+            exit_price = stop_price
+            exit_reason = "STOP FIRST (AMBIGUOUS BAR)"
+            break
+        if stop_touched:
+            exit_position = position
+            exit_price = stop_price
+            exit_reason = "STOP"
+            break
+        if target_touched:
+            exit_position = position
+            exit_price = target_price
+            exit_reason = "TARGET"
+            break
+
+    return {
+        "exit_position": exit_position,
+        "exit_price": float(exit_price),
+        "exit_reason": exit_reason,
+        "stop_price": float(stop_price),
+        "target_price": float(target_price),
+        "risk_per_share": float(abs(entry_price - stop_price)),
+    }
+
+
+
+def run_strategy_backtest(
+    data,
+    test_start_date,
+    holding_days,
+    minimum_quality,
+    cost_bps_per_side,
+    stop_atr_multiple=1.25,
+    reward_to_risk=2.0,
+):
+    """
+    Backtest signals without look-ahead bias using realistic trade management.
+
+    Signals are formed only after a completed daily close. Entry occurs at the
+    next session's open. ATR stop and target levels are fixed from information
+    known at the signal close. Only one position can be open at a time.
+    """
+    prepared = remove_unfinished_daily_bar(data)
+    prepared = prepared.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    prepared = add_backtest_indicators(prepared)
+
+    required_columns = [
+        "Open", "High", "Low", "Close", "MA20", "MA50", "RSI", "MACD",
+        "Signal", "Histogram", "Upper Band", "Lower Band",
+        "Average Volume 20", "ATR14",
+    ]
+    prepared = prepared.dropna(subset=required_columns)
+
+    trades = []
+    index_position = 1
+
+    while index_position < len(prepared) - 1:
+        signal_row = prepared.iloc[index_position]
+        previous_row = prepared.iloc[index_position - 1]
+        signal_date = pd.Timestamp(prepared.index[index_position])
+
+        if signal_date.date() < test_start_date:
+            index_position += 1
+            continue
+
+        setup = calculate_trade_setup(
+            price=float(signal_row["Close"]),
+            previous_price=float(previous_row["Close"]),
+            ma20=float(signal_row["MA20"]),
+            ma50=float(signal_row["MA50"]),
+            rsi=float(signal_row["RSI"]),
+            macd=float(signal_row["MACD"]),
+            signal=float(signal_row["Signal"]),
+            histogram=float(signal_row["Histogram"]),
+            previous_histogram=float(previous_row["Histogram"]),
+            upper_band=float(signal_row["Upper Band"]),
+            lower_band=float(signal_row["Lower Band"]),
+            latest_volume=int(signal_row["Volume"]),
+            average_volume_20=float(signal_row["Average Volume 20"]),
+        )
+
+        if setup["bias"] not in ("LONG BIAS", "SHORT BIAS"):
+            index_position += 1
+            continue
+        if setup["setup_quality"] < minimum_quality:
+            index_position += 1
+            continue
+
+        entry_position = index_position + 1
+        if entry_position >= len(prepared):
+            break
+
+        entry_price = float(prepared["Open"].iloc[entry_position])
+        if entry_price <= 0:
+            index_position += 1
+            continue
+
+        direction = "LONG" if setup["bias"] == "LONG BIAS" else "SHORT"
+        simulated = simulate_atr_trade_exit(
+            prepared=prepared,
+            entry_position=entry_position,
+            maximum_holding_days=holding_days,
+            direction=direction,
+            entry_price=entry_price,
+            atr_at_signal=float(signal_row["ATR14"]),
+            stop_atr_multiple=stop_atr_multiple,
+            reward_to_risk=reward_to_risk,
+        )
+        exit_position = simulated["exit_position"]
+        exit_price = simulated["exit_price"]
+
+        gross_return = (
+            (exit_price / entry_price) - 1
+            if direction == "LONG"
+            else (entry_price / exit_price) - 1
+        )
+        round_trip_cost = 2 * cost_bps_per_side / 10000
+        net_return = gross_return - round_trip_cost
+
+        trades.append(
+            {
+                "Signal Date": signal_date,
+                "Entry Date": pd.Timestamp(prepared.index[entry_position]),
+                "Exit Date": pd.Timestamp(prepared.index[exit_position]),
+                "Direction": direction,
+                "Setup Quality": int(setup["setup_quality"]),
+                "Direction Score": int(setup["direction_score"]),
+                "Entry Price": entry_price,
+                "Stop Price": simulated["stop_price"],
+                "Target Price": simulated["target_price"],
+                "Exit Price": exit_price,
+                "Exit Reason": simulated["exit_reason"],
+                "Gross Return": gross_return,
+                "Net Return": net_return,
+                "Winner": net_return > 0,
+                "Holding Sessions": int(exit_position - entry_position + 1),
+            }
+        )
+
+        index_position = exit_position + 1
+
+    return pd.DataFrame(trades), prepared
+
+
+def summarize_return_series(returns):
+    """Return robust summary metrics for one chronological trade sample."""
+    returns = pd.Series(returns, dtype=float).dropna()
+    if returns.empty:
+        return None
+
+    winning = returns[returns > 0]
+    losing = returns[returns <= 0]
+    gross_profit = float(winning.sum())
+    gross_loss = float(abs(losing.sum()))
+    profit_factor = float("inf") if gross_loss == 0 else gross_profit / gross_loss
+    average_win = float(winning.mean()) if not winning.empty else 0.0
+    average_loss = float(losing.mean()) if not losing.empty else 0.0
+    payoff_ratio = (
+        average_win / abs(average_loss)
+        if average_loss < 0
+        else float("inf") if average_win > 0 else 0.0
+    )
+
+    return {
+        "trades": int(len(returns)),
+        "win_rate": float((returns > 0).mean()),
+        "average_return": float(returns.mean()),
+        "median_return": float(returns.median()),
+        "profit_factor": float(profit_factor),
+        "average_win": average_win,
+        "average_loss": average_loss,
+        "payoff_ratio": float(payoff_ratio),
+        "return_std": float(returns.std(ddof=1)) if len(returns) > 1 else 0.0,
+    }
+
+
+def evaluate_backtest_edge(statistics):
+    """Grade evidence without pretending a small or overfit sample is reliable."""
+    if not statistics:
+        return {
+            "grade": "INSUFFICIENT",
+            "label": "No historical evidence",
+            "score": -12,
+            "reason": "No qualifying historical trades were found.",
+        }
+
+    total = statistics["total_trades"]
+    full_average = statistics["average_return"]
+    full_pf = statistics["profit_factor"]
+    oos = statistics.get("out_of_sample") or {}
+    oos_trades = int(oos.get("trades") or 0)
+    oos_average = float(oos.get("average_return") or 0.0)
+    oos_pf = float(oos.get("profit_factor") or 0.0)
+
+    if total < 15 or oos_trades < 5:
+        return {
+            "grade": "INSUFFICIENT",
+            "label": "Edge unproven",
+            "score": -6,
+            "reason": f"Only {total} trades and {oos_trades} out-of-sample trades were available.",
+        }
+
+    if full_average <= 0 or full_pf < 0.95 or oos_average < 0 or oos_pf < 0.90:
+        return {
+            "grade": "NEGATIVE",
+            "label": "Historical edge failed",
+            "score": -24,
+            "reason": "Expectancy or out-of-sample performance was negative after costs.",
+        }
+
+    if (
+        total >= 40
+        and oos_trades >= 10
+        and full_pf >= 1.35
+        and oos_pf >= 1.15
+        and full_average >= 0.002
+        and oos_average >= 0.001
+        and statistics["max_drawdown"] > -0.25
+    ):
+        return {
+            "grade": "STRONG",
+            "label": "Stronger historical edge",
+            "score": 22,
+            "reason": "Positive expectancy held up in a larger out-of-sample sample.",
+        }
+
+    if (
+        total >= 20
+        and oos_trades >= 7
+        and full_pf >= 1.15
+        and oos_pf >= 1.0
+        and full_average > 0
+        and oos_average > 0
+    ):
+        return {
+            "grade": "MODERATE",
+            "label": "Moderate historical edge",
+            "score": 12,
+            "reason": "The strategy remained positive after the chronological split.",
+        }
+
+    return {
+        "grade": "WEAK",
+        "label": "Weak historical edge",
+        "score": 2,
+        "reason": "Results were positive but not strong or consistent enough for confirmation.",
+    }
+
+
+def calculate_backtest_statistics(trades, prepared_history):
+    """Calculate performance, exposure, and chronological out-of-sample evidence."""
     if trades.empty:
         return None
 
-    returns = trades["Net Return"].astype(float)
-
+    ordered = trades.sort_values("Entry Date").reset_index(drop=True)
+    returns = ordered["Net Return"].astype(float)
     strategy_growth = (1 + returns).cumprod()
-
     running_peak = strategy_growth.cummax()
+    drawdown = (strategy_growth / running_peak) - 1
+    full_summary = summarize_return_series(returns)
 
-    drawdown = (
-        strategy_growth / running_peak
-    ) - 1
+    split_position = max(1, int(len(ordered) * 0.70))
+    if split_position >= len(ordered):
+        split_position = max(1, len(ordered) - 1)
+    in_sample_trades = ordered.iloc[:split_position]
+    out_of_sample_trades = ordered.iloc[split_position:]
+    in_sample_summary = summarize_return_series(in_sample_trades["Net Return"])
+    out_of_sample_summary = summarize_return_series(out_of_sample_trades["Net Return"])
 
-    winning_returns = returns[returns > 0]
-    losing_returns = returns[returns <= 0]
-
-    if losing_returns.empty:
-        profit_factor = float("inf")
-    else:
-        profit_factor = (
-            winning_returns.sum()
-            / abs(losing_returns.sum())
-        )
-
-    first_entry_date = pd.Timestamp(
-        trades["Entry Date"].iloc[0]
-    )
-
-    last_exit_date = pd.Timestamp(
-        trades["Exit Date"].iloc[-1]
-    )
-
+    first_entry_date = pd.Timestamp(ordered["Entry Date"].iloc[0])
+    last_exit_date = pd.Timestamp(ordered["Exit Date"].iloc[-1])
     benchmark_prices = prepared_history.loc[
-        (
-            prepared_history.index
-            >= first_entry_date
-        )
-        & (
-            prepared_history.index
-            <= last_exit_date
-        ),
+        (prepared_history.index >= first_entry_date)
+        & (prepared_history.index <= last_exit_date),
         "Close",
     ]
-
-    if benchmark_prices.empty:
-        buy_hold_return = 0.0
-    else:
-        buy_hold_return = (
-            float(benchmark_prices.iloc[-1])
-            / float(benchmark_prices.iloc[0])
-        ) - 1
-
-    equity_curve = pd.DataFrame(
-        {
-            "Strategy": 10000 * strategy_growth.values,
-        },
-        index=pd.to_datetime(
-            trades["Exit Date"]
-        ),
+    buy_hold_return = (
+        float(benchmark_prices.iloc[-1]) / float(benchmark_prices.iloc[0]) - 1
+        if len(benchmark_prices) >= 2
+        else 0.0
     )
 
-    if not benchmark_prices.empty:
-        benchmark_at_exits = (
-            benchmark_prices
-            .reindex(
-                equity_curve.index,
-                method="ffill",
+    if "Holding Sessions" in ordered:
+        invested_sessions = int(ordered["Holding Sessions"].sum())
+    else:
+        invested_sessions = int(
+            sum(
+                max(1, len(prepared_history.loc[entry:exit]))
+                for entry, exit in zip(ordered["Entry Date"], ordered["Exit Date"])
             )
         )
+    exposure = min(1.0, invested_sessions / max(len(benchmark_prices), 1))
 
+    equity_curve = pd.DataFrame(
+        {"Strategy": 10000 * strategy_growth.values},
+        index=pd.to_datetime(ordered["Exit Date"]),
+    )
+    if not benchmark_prices.empty:
+        benchmark_at_exits = benchmark_prices.reindex(equity_curve.index, method="ffill")
         equity_curve["Buy and Hold"] = (
-            10000
-            * benchmark_at_exits
-            / float(benchmark_prices.iloc[0])
+            10000 * benchmark_at_exits / float(benchmark_prices.iloc[0])
         )
 
     statistics = {
-        "total_trades": len(trades),
-        "win_rate": float(trades["Winner"].mean()),
-        "average_return": float(returns.mean()),
-        "median_return": float(returns.median()),
-        "total_return": float(
-            strategy_growth.iloc[-1] - 1
-        ),
+        "total_trades": len(ordered),
+        "win_rate": full_summary["win_rate"],
+        "average_return": full_summary["average_return"],
+        "median_return": full_summary["median_return"],
+        "total_return": float(strategy_growth.iloc[-1] - 1),
         "max_drawdown": float(drawdown.min()),
-        "profit_factor": float(profit_factor),
+        "profit_factor": full_summary["profit_factor"],
+        "payoff_ratio": full_summary["payoff_ratio"],
+        "average_win": full_summary["average_win"],
+        "average_loss": full_summary["average_loss"],
         "buy_hold_return": float(buy_hold_return),
+        "exposure": float(exposure),
+        "in_sample": in_sample_summary,
+        "out_of_sample": out_of_sample_summary,
+        "split_date": (
+            pd.Timestamp(out_of_sample_trades["Entry Date"].iloc[0])
+            if not out_of_sample_trades.empty
+            else None
+        ),
         "equity_curve": equity_curve,
     }
-
+    statistics["edge"] = evaluate_backtest_edge(statistics)
     return statistics
-
 
 def build_direction_breakdown(trades):
     """Summarize long and short trades separately."""
@@ -1887,1557 +2517,1941 @@ backtest_lookback_choices = {
     "10 years": 10,
 }
 
-with st.container(border=True):
-    st.subheader("Analyze a stock")
-    st.caption(
-        "Enter a ticker, then open optional settings only when "
-        "you want to change the watchlist or backtest."
+
+# -----------------------------------------------------------------------------
+# Clean, task-first interface
+# -----------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.25rem; padding-bottom: 3rem; max-width: 1180px;}
+    [data-testid="stMetric"] {background: rgba(128,128,128,0.06); padding: 0.8rem; border-radius: 0.75rem;}
+    [data-testid="stMetricValue"] {white-space: normal; overflow-wrap: anywhere; line-height: 1.15;}
+    [data-testid="stMetricLabel"] {white-space: normal; overflow-wrap: anywhere;}
+    .summary-card {
+        background: rgba(128,128,128,0.06);
+        border: 1px solid rgba(128,128,128,0.18);
+        border-radius: 0.75rem;
+        padding: 0.72rem 0.82rem;
+        min-height: 5.2rem;
+        width: 100%;
+        box-sizing: border-box;
+        overflow: visible;
+    }
+    .summary-card-label {
+        font-size: 0.82rem;
+        opacity: 0.72;
+        line-height: 1.2;
+        margin-bottom: 0.35rem;
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+    .summary-card-value {
+        font-size: 1.05rem;
+        font-weight: 650;
+        line-height: 1.25;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: normal;
+    }
+    div[data-testid="stButton"] > button {min-height: 2.7rem;}
+    @media (max-width: 700px) {
+        .block-container {padding-left: 0.8rem; padding-right: 0.8rem; padding-top: 0.7rem;}
+        [data-testid="stMetric"] {padding: 0.55rem;}
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def render_summary_card(label, value):
+    """Render a flexible summary card that safely wraps long labels and values."""
+    from html import escape
+
+    card_html = (
+        '<div class="summary-card">'
+        f'<div class="summary-card-label">{escape(str(label))}</div>'
+        f'<div class="summary-card-value">{escape(str(value))}</div>'
+        '</div>'
     )
-
-    with st.form("analysis_form"):
-        ticker_column, range_column = st.columns([2, 1])
-
-        with ticker_column:
-            ticker = st.text_input(
-                "Ticker",
-                "AAL",
-                help="Examples: AAL, INTC, CVX, VTI",
-            ).strip().upper()
-
-        with range_column:
-            selected_period = st.selectbox(
-                "Chart range",
-                list(period_choices.keys()),
-            )
-
-        with st.expander("Optional watchlist and backtest settings"):
-            watchlist_text = st.text_input(
-                "Watchlist tickers",
-                "VTI, VXUS, AAL, CVX, INTC",
-                help="Separate ticker symbols with commas.",
-            )
-
-            st.markdown("#### Backtesting")
-
-            backtest_column_1, backtest_column_2 = st.columns(2)
-
-            with backtest_column_1:
-                backtest_lookback_label = st.selectbox(
-                    "Historical test period",
-                    list(backtest_lookback_choices.keys()),
-                    index=1,
-                )
-
-                backtest_holding_days = st.selectbox(
-                    "Hold each trade for",
-                    [1, 3, 5, 10, 20],
-                    index=2,
-                    format_func=lambda value: (
-                        f"{value} trading day"
-                        if value == 1
-                        else f"{value} trading days"
-                    ),
-                )
-
-            with backtest_column_2:
-                backtest_minimum_quality = st.slider(
-                    "Minimum setup quality",
-                    min_value=50,
-                    max_value=90,
-                    value=70,
-                    step=5,
-                )
-
-                backtest_cost_bps = st.number_input(
-                    "Estimated cost per side (basis points)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=5.0,
-                    step=1.0,
-                )
-
-        analyze = st.form_submit_button(
-            "Analyze stock",
-            type="primary",
-            use_container_width=True,
-        )
+    st.markdown(card_html, unsafe_allow_html=True)
 
 
-if analyze:
-    st.session_state.analysis_ready = True
+if "nav_page" not in st.session_state:
+    st.session_state.nav_page = "Trade Finder"
+if "analyze_ticker_input" not in st.session_state:
+    st.session_state.analyze_ticker_input = "AAL"
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
+if "finder_results" not in st.session_state:
+    st.session_state.finder_results = None
+if "finder_scan_summary" not in st.session_state:
+    st.session_state.finder_scan_summary = None
+if "research_result" not in st.session_state:
+    st.session_state.research_result = None
+if "decision_from_finder" not in st.session_state:
+    st.session_state.decision_from_finder = False
+if "pending_analysis_ticker" not in st.session_state:
+    st.session_state.pending_analysis_ticker = None
+if "finder_scan_mode" not in st.session_state:
+    st.session_state.finder_scan_mode = "Scan the Market"
 
-    try:
-        analyzed_quote = get_latest_quote(ticker)
-        analyzed_price = analyzed_quote.get("price")
-    except Exception:
-        analyzed_price = None
+supabase, supabase_error = get_supabase_client()
+logged_in = bool(st.session_state.get("supabase_user_id"))
 
-    if analyzed_price is not None:
-        st.session_state.analysis_entry_anchors[ticker] = float(
-            analyzed_price
-        )
 
-if st.session_state.analysis_ready:
-    if not ticker:
-        st.error("Please enter a stock ticker.")
-        st.stop()
 
-    try:
-        with st.spinner(f"Loading {ticker}..."):
-            stock = yf.Ticker(ticker)
-
-            history = stock.history(
-                period=period_choices[selected_period],
-                auto_adjust=False,
-            )
-
-            backtest_years = (
-                backtest_lookback_choices[
-                    backtest_lookback_label
-                ]
-            )
-
-            backtest_start_timestamp = (
-                pd.Timestamp.now(
-                    tz="America/New_York"
-                )
-                - pd.DateOffset(
-                    years=backtest_years
-                )
-            )
-
-            backtest_download_start = (
-                backtest_start_timestamp
-                - pd.DateOffset(days=180)
-            )
-
-            backtest_history = stock.history(
-                start=backtest_download_start.date().isoformat(),
-                auto_adjust=True,
-            )
-
-    except Exception as error:
-        st.error(f"Unable to download stock data: {error}")
-        st.stop()
-
-    history = history.dropna(
-        subset=[
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-        ]
+def open_analysis_for(symbol):
+    """Open a finder result directly, preserving its verified verdict."""
+    clean_symbol = symbol.strip().upper()
+    matched = next(
+        (
+            item for item in st.session_state.get("finder_results", [])
+            if item.get("ticker") == clean_symbol and "error" not in item
+        ),
+        None,
     )
+    st.session_state.analyze_ticker_input = clean_symbol
+    st.session_state.pending_analysis_ticker = None if matched else clean_symbol
+    st.session_state.decision_from_finder = True
+    st.session_state.nav_page = "Analyze"
+    st.session_state.analysis_result = matched
 
-    if history.empty or len(history) < 50:
-        st.error(
-            "Not enough stock data was found. "
-            "Check the ticker symbol."
-        )
-        st.stop()
+def return_to_trade_finder():
+    st.session_state.nav_page = "Trade Finder"
+    st.session_state.decision_from_finder = False
+    st.session_state.pending_analysis_ticker = None
 
-    # Moving averages and Bollinger Bands
+
+def analyze_another_stock():
+    st.session_state.decision_from_finder = False
+    st.session_state.pending_analysis_ticker = None
+    st.session_state.analysis_result = None
+
+
+def open_research_for(symbol):
+    st.session_state.research_ticker_input = symbol
+    st.session_state.nav_page = "Research"
+
+
+def render_account_sidebar():
+    with st.sidebar:
+        st.header("Account")
+
+        if supabase_error:
+            st.error(supabase_error)
+            st.caption("Analysis works, but cloud trade saving is unavailable.")
+
+        elif not logged_in:
+            sign_in_tab, create_account_tab = st.tabs(["Sign in", "Create account"])
+
+            with sign_in_tab:
+                with st.form("sign_in_form"):
+                    email = st.text_input("Email", key="sign_in_email").strip()
+                    password = st.text_input("Password", type="password", key="sign_in_password")
+                    clicked = st.form_submit_button("Sign in", use_container_width=True)
+
+                if clicked:
+                    if not email or not password:
+                        st.error("Enter your email and password.")
+                    else:
+                        try:
+                            response = supabase.auth.sign_in_with_password(
+                                {"email": email, "password": password}
+                            )
+                            remember_auth_response(response)
+                            st.rerun()
+                        except Exception as error:
+                            st.error(f"Sign-in failed: {error}")
+
+            with create_account_tab:
+                with st.form("create_account_form"):
+                    email = st.text_input("Email", key="create_email").strip()
+                    password = st.text_input("Password", type="password", key="create_password")
+                    again = st.text_input("Confirm password", type="password", key="create_password_again")
+                    clicked = st.form_submit_button("Create account", use_container_width=True)
+
+                if clicked:
+                    if not email or not password:
+                        st.error("Enter an email and password.")
+                    elif password != again:
+                        st.error("The passwords do not match.")
+                    elif len(password) < 8:
+                        st.error("Use a password with at least 8 characters.")
+                    else:
+                        try:
+                            response = supabase.auth.sign_up(
+                                {"email": email, "password": password}
+                            )
+                            remember_auth_response(response)
+                            if response.session:
+                                st.rerun()
+                            else:
+                                st.success("Account created. Confirm the email, then sign in.")
+                        except Exception as error:
+                            st.error(f"Account creation failed: {error}")
+        else:
+            email = st.session_state.get("supabase_user_email", "Signed-in user")
+            st.success(f"Signed in as {email}")
+
+            try:
+                compact_trades = load_cloud_trades(
+                    supabase,
+                    st.session_state.supabase_user_id,
+                )
+                st.metric("Open trades", len(compact_trades))
+            except Exception:
+                pass
+
+            if st.button("Sign out", use_container_width=True):
+                try:
+                    supabase.auth.sign_out()
+                except Exception:
+                    pass
+                clear_auth_state()
+                st.rerun()
+
+        st.divider()
+        st.caption("Account and app settings live here. Trading workflows use the main pages.")
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def build_stock_snapshot(ticker, period="1y"):
+    symbol = ticker.strip().upper()
+    stock = yf.Ticker(symbol)
+    history = stock.history(period=period, auto_adjust=False)
+    history = history.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
+    if len(history) < 55:
+        raise ValueError("Not enough daily price history was returned.")
+
     history["MA20"] = history["Close"].rolling(20).mean()
     history["MA50"] = history["Close"].rolling(50).mean()
+    std = history["Close"].rolling(20).std()
+    history["Upper Band"] = history["MA20"] + 2 * std
+    history["Lower Band"] = history["MA20"] - 2 * std
 
-    standard_deviation = history["Close"].rolling(20).std()
-
-    history["Upper Band"] = (
-        history["MA20"] + (2 * standard_deviation)
-    )
-
-    history["Lower Band"] = (
-        history["MA20"] - (2 * standard_deviation)
-    )
-
-    # RSI
     movement = history["Close"].diff()
-
     gains = movement.clip(lower=0).rolling(14).mean()
     losses = -movement.clip(upper=0).rolling(14).mean()
+    rs = gains / losses
+    history["RSI"] = 100 - (100 / (1 + rs))
+    history.loc[(gains == 0) & (losses == 0), "RSI"] = 50.0
+    history.loc[(gains > 0) & (losses == 0), "RSI"] = 100.0
+    history.loc[(gains == 0) & (losses > 0), "RSI"] = 0.0
 
-    relative_strength = gains / losses
+    ema12 = history["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = history["Close"].ewm(span=26, adjust=False).mean()
+    history["MACD"] = ema12 - ema26
+    history["Signal"] = history["MACD"].ewm(span=9, adjust=False).mean()
+    history["Histogram"] = history["MACD"] - history["Signal"]
+    history["Average Volume 20"] = history["Volume"].rolling(20).mean()
 
-    history["RSI"] = 100 - (
-        100 / (1 + relative_strength)
-    )
-
-    # MACD
-    ema_12 = history["Close"].ewm(
-        span=12,
-        adjust=False,
-    ).mean()
-
-    ema_26 = history["Close"].ewm(
-        span=26,
-        adjust=False,
-    ).mean()
-
-    history["MACD"] = ema_12 - ema_26
-
-    history["Signal"] = history["MACD"].ewm(
-        span=9,
-        adjust=False,
-    ).mean()
-
-    history["Histogram"] = (
-        history["MACD"] - history["Signal"]
-    )
-
-    previous_close = history["Close"].shift(1)
+    prior_close = history["Close"].shift(1)
     true_range = pd.concat(
         [
             history["High"] - history["Low"],
-            (history["High"] - previous_close).abs(),
-            (history["Low"] - previous_close).abs(),
+            (history["High"] - prior_close).abs(),
+            (history["Low"] - prior_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
-
     history["ATR14"] = true_range.rolling(14).mean()
 
     latest = history.iloc[-1]
     previous = history.iloc[-2]
-
-    price = float(latest["Close"])
-    previous_price = float(previous["Close"])
-
-    change = price - previous_price
-    change_percent = (change / previous_price) * 100
-
-    ma20 = float(latest["MA20"])
-    ma50 = float(latest["MA50"])
-
     rsi = float(latest["RSI"])
     if math.isnan(rsi):
         rsi = 50.0
 
-    macd = float(latest["MACD"])
-    signal = float(latest["Signal"])
-    histogram = float(latest["Histogram"])
-    previous_histogram = float(
-        history["Histogram"].iloc[-2]
-    )
-
-    upper_band = float(latest["Upper Band"])
-    lower_band = float(latest["Lower Band"])
-
-    atr_14 = float(latest["ATR14"])
-    if math.isnan(atr_14) or atr_14 <= 0:
-        atr_14 = max(price * 0.02, 0.01)
-
-    latest_volume = int(latest["Volume"])
-
-    average_volume_20 = float(
-        history["Volume"].rolling(20).mean().iloc[-1]
-    )
-
-    # Trend analysis
-    if price > ma20 and price > ma50:
-        trend = "Uptrend"
-        trend_text = "Price is above both moving averages."
-        trend_box = st.success
-
-    elif price < ma20 and price < ma50:
-        trend = "Downtrend"
-        trend_text = "Price is below both moving averages."
-        trend_box = st.error
-
-    else:
-        trend = "Mixed trend"
-        trend_text = "Price is between the moving averages."
-        trend_box = st.warning
-
-    # RSI analysis
-    if rsi >= 70:
-        rsi_status = "Potentially overbought"
-        rsi_text = (
-            "RSI is above 70. Recent upward movement "
-            "may be stretched."
-        )
-
-    elif rsi <= 30:
-        rsi_status = "Potentially oversold"
-        rsi_text = (
-            "RSI is below 30. Recent downward movement "
-            "may be stretched."
-        )
-
-    else:
-        rsi_status = "Neutral"
-        rsi_text = "RSI is between 30 and 70."
-
-    # MACD analysis
-    if macd > signal:
-        macd_status = "Bullish momentum"
-        macd_text = "MACD is above its signal line."
-        macd_box = st.success
-
-    else:
-        macd_status = "Bearish momentum"
-        macd_text = "MACD is below its signal line."
-        macd_box = st.error
-
-    # Bollinger Band analysis
-    if price > upper_band:
-        band_status = "Above the upper band"
-
-    elif price < lower_band:
-        band_status = "Below the lower band"
-
-    else:
-        band_status = "Inside the bands"
-
-    trade_setup = calculate_trade_setup(
-        price=price,
-        previous_price=previous_price,
-        ma20=ma20,
-        ma50=ma50,
+    setup = calculate_trade_setup(
+        price=float(latest["Close"]),
+        previous_price=float(previous["Close"]),
+        ma20=float(latest["MA20"]),
+        ma50=float(latest["MA50"]),
         rsi=rsi,
-        macd=macd,
-        signal=signal,
-        histogram=histogram,
-        previous_histogram=previous_histogram,
-        upper_band=upper_band,
-        lower_band=lower_band,
-        latest_volume=latest_volume,
-        average_volume_20=average_volume_20,
+        macd=float(latest["MACD"]),
+        signal=float(latest["Signal"]),
+        histogram=float(latest["Histogram"]),
+        previous_histogram=float(previous["Histogram"]),
+        upper_band=float(latest["Upper Band"]),
+        lower_band=float(latest["Lower Band"]),
+        latest_volume=int(latest["Volume"]),
+        average_volume_20=float(latest["Average Volume 20"]),
     )
+
+    quote = get_latest_quote(symbol)
+    atr = float(latest["ATR14"])
+    if math.isnan(atr) or atr <= 0:
+        atr = max(float(latest["Close"]) * 0.02, 0.01)
+
+    direction = None
+    plan = None
+    if setup["bias"] != "WAIT":
+        direction = "LONG" if setup["bias"] == "LONG BIAS" else "SHORT"
+        plan = build_suggested_trade_plan(
+            ticker=symbol,
+            direction=direction,
+            fallback_price=float(latest["Close"]),
+            atr_14=atr,
+            entry_price_override=quote.get("price") or float(latest["Close"]),
+        )
+
+    return {
+        "ticker": symbol,
+        "history": history,
+        "quote": quote,
+        "setup": setup,
+        "direction": direction,
+        "plan": plan,
+        "close": float(latest["Close"]),
+        "previous_close": float(previous["Close"]),
+        "ma20": float(latest["MA20"]),
+        "ma50": float(latest["MA50"]),
+        "rsi": rsi,
+        "macd": float(latest["MACD"]),
+        "signal": float(latest["Signal"]),
+        "histogram": float(latest["Histogram"]),
+        "atr": atr,
+    }
+
+
+def run_unconditional_long_study(data, test_start_date, holding_days, cost_bps_per_side):
+    """Provide a same-horizon baseline for the direct oil-shock study."""
+    prepared = remove_unfinished_daily_bar(data).dropna(
+        subset=["Open", "High", "Low", "Close", "Volume"]
+    )
+    trades = []
+    index_position = 0
+
+    while index_position < len(prepared) - holding_days:
+        signal_date = pd.Timestamp(prepared.index[index_position])
+        if signal_date.date() < test_start_date:
+            index_position += 1
+            continue
+
+        entry_position = index_position + 1
+        exit_position = entry_position + holding_days - 1
+        if exit_position >= len(prepared):
+            break
+
+        entry_price = float(prepared["Open"].iloc[entry_position])
+        exit_price = float(prepared["Close"].iloc[exit_position])
+        if entry_price > 0 and exit_price > 0:
+            gross_return = (exit_price / entry_price) - 1
+            net_return = gross_return - (2 * cost_bps_per_side / 10000)
+            trades.append(
+                {
+                    "Signal Date": signal_date,
+                    "Entry Date": pd.Timestamp(prepared.index[entry_position]),
+                    "Exit Date": pd.Timestamp(prepared.index[exit_position]),
+                    "Direction": "LONG",
+                    "Entry Price": entry_price,
+                    "Exit Price": exit_price,
+                    "Gross Return": gross_return,
+                    "Net Return": net_return,
+                    "Winner": net_return > 0,
+                }
+            )
+        index_position = exit_position + 1
+
+    return pd.DataFrame(trades), prepared
+
+
+BROAD_LIQUID_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA",
+    "AVGO", "AMD", "INTC", "QCOM", "MU", "AMAT", "LRCX", "ARM", "SMCI",
+    "NFLX", "CRM", "ORCL", "ADBE", "PLTR", "SNOW", "SHOP", "UBER",
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "COF", "XLF", "KRE",
+    "XOM", "CVX", "COP", "OXY", "SLB", "HAL", "MPC", "XLE",
+    "AAL", "DAL", "UAL", "LUV", "ALK", "JBLU", "BA", "JETS",
+    "CAT", "DE", "GE", "RTX", "LMT", "NOC", "HON", "UPS", "FDX",
+    "WMT", "COST", "TGT", "HD", "LOW", "NKE", "SBUX", "MCD",
+    "KO", "PEP", "PG", "PM", "MO", "DIS", "CMCSA", "T", "VZ",
+    "JNJ", "LLY", "UNH", "PFE", "MRK", "ABBV", "TMO", "ABT",
+    "NEM", "GOLD", "AEM", "GDX", "GLD", "SLV",
+    "SPY", "QQQ", "IWM", "DIA", "SMH", "SOXX", "XLK", "XLI", "XLY",
+    "RIVN", "LCID", "F", "GM", "CCL", "NCLH", "RCL", "MARA", "RIOT",
+    "COIN", "HOOD", "SOFI", "PYPL", "SQ", "AFRM", "DKNG", "ROKU",
+]
+
+
+def get_market_session(now_eastern=None):
+    """Return a time-based U.S. market session in Eastern time."""
+    now_eastern = now_eastern or datetime.now(ZoneInfo("America/New_York"))
+    current_time = now_eastern.time()
+
+    if now_eastern.weekday() >= 5:
+        return {"name": "closed", "label": "Market closed", "now": now_eastern}
+    if clock_time(4, 0) <= current_time < clock_time(9, 30):
+        return {"name": "premarket", "label": "Premarket", "now": now_eastern}
+    if clock_time(9, 30) <= current_time < clock_time(16, 0):
+        return {"name": "regular", "label": "Regular market", "now": now_eastern}
+    if clock_time(16, 0) <= current_time < clock_time(20, 0):
+        return {"name": "afterhours", "label": "After-hours", "now": now_eastern}
+    return {"name": "closed", "label": "Market closed", "now": now_eastern}
+
+
+def quote_session_metrics(quote, session_name):
+    """Extract the most appropriate quote fields for the active session."""
+    if session_name == "premarket":
+        price = extract_number(quote.get("preMarketPrice"))
+        change_percent = extract_number(quote.get("preMarketChangePercent"))
+        volume = extract_number(quote.get("preMarketVolume"))
+    elif session_name == "afterhours":
+        price = extract_number(quote.get("postMarketPrice"))
+        change_percent = extract_number(quote.get("postMarketChangePercent"))
+        volume = extract_number(quote.get("postMarketVolume"))
+    else:
+        price = extract_number(quote.get("regularMarketPrice") or quote.get("intradayprice"))
+        change_percent = extract_number(quote.get("regularMarketChangePercent"))
+        volume = extract_number(
+            quote.get("regularMarketVolume") or quote.get("dayvolume") or quote.get("eodvolume")
+        )
+
+    return price, change_percent, volume
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_market_scan_candidates(max_pool=220):
+    """Collect a broad online mover pool before expensive stock analysis."""
+    session = get_market_session()
+    screens = [
+        ("most_actives", "Most active"),
+        ("day_gainers", "Day gainer"),
+        ("day_losers", "Day loser"),
+    ]
+    candidates = {}
+
+    for screen_name, source_label in screens:
+        try:
+            response = yf.screen(screen_name, count=100)
+            quotes = response.get("quotes", [])
+        except Exception:
+            quotes = []
+
+        for quote in quotes:
+            symbol = str(quote.get("symbol") or "").strip().upper()
+            if not symbol or symbol.startswith("^") or "=" in symbol:
+                continue
+            quote_type = str(quote.get("quoteType") or "").upper()
+            if quote_type and quote_type not in {"EQUITY", "ETF"}:
+                continue
+
+            price, change_percent, volume = quote_session_metrics(quote, session["name"])
+            regular_price = extract_number(quote.get("regularMarketPrice") or quote.get("intradayprice"))
+            if price is None:
+                price = regular_price
+
+            item = candidates.setdefault(
+                symbol,
+                {
+                    "ticker": symbol,
+                    "sources": [],
+                    "session_price": price,
+                    "session_change_percent": change_percent,
+                    "session_volume": volume,
+                },
+            )
+            if source_label not in item["sources"]:
+                item["sources"].append(source_label)
+            if item.get("session_change_percent") is None and change_percent is not None:
+                item["session_change_percent"] = change_percent
+            if item.get("session_volume") is None and volume is not None:
+                item["session_volume"] = volume
+            if item.get("session_price") is None and price is not None:
+                item["session_price"] = price
+
+    for symbol in BROAD_LIQUID_UNIVERSE:
+        candidates.setdefault(
+            symbol,
+            {
+                "ticker": symbol,
+                "sources": ["Liquid market universe"],
+                "session_price": None,
+                "session_change_percent": None,
+                "session_volume": None,
+            },
+        )
+
+    return {
+        "session_name": session["name"],
+        "session_label": session["label"],
+        "candidates": list(candidates.values())[:max_pool],
+    }
+
+
+def _download_field(frame, symbol, field):
+    """Extract one ticker/field series from a yfinance batch download."""
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float)
+    if isinstance(frame.columns, pd.MultiIndex):
+        first = frame.columns.get_level_values(0)
+        second = frame.columns.get_level_values(1)
+        try:
+            if symbol in first:
+                selected = frame[symbol]
+                return selected[field].dropna() if field in selected else pd.Series(dtype=float)
+            if symbol in second and field in first:
+                return frame[field][symbol].dropna()
+        except Exception:
+            return pd.Series(dtype=float)
+    if field in frame.columns:
+        return frame[field].dropna()
+    return pd.Series(dtype=float)
+
+
+def _eastern_index(index):
+    converted = pd.DatetimeIndex(pd.to_datetime(index))
+    if converted.tz is None:
+        converted = converted.tz_localize("America/New_York")
+    else:
+        converted = converted.tz_convert("America/New_York")
+    return converted
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_extended_session_metrics(symbols, session_name):
+    """Batch-calculate premarket or after-hours movement using extended bars."""
+    symbols = tuple(symbols)
+    if not symbols or session_name not in {"premarket", "afterhours"}:
+        return {}
+
+    now_eastern = datetime.now(ZoneInfo("America/New_York"))
+    today = now_eastern.date()
+    results = {}
+
+    for chunk_start in range(0, len(symbols), 45):
+        chunk = list(symbols[chunk_start:chunk_start + 45])
+        try:
+            intraday = yf.download(
+                tickers=chunk,
+                period="5d",
+                interval="5m",
+                prepost=True,
+                auto_adjust=False,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+            daily = yf.download(
+                tickers=chunk,
+                period="10d",
+                interval="1d",
+                auto_adjust=False,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+        except Exception:
+            continue
+
+        for symbol in chunk:
+            close = _download_field(intraday, symbol, "Close")
+            volume = _download_field(intraday, symbol, "Volume")
+            daily_close = _download_field(daily, symbol, "Close")
+            if close.empty or daily_close.empty:
+                continue
+
+            try:
+                close_index = _eastern_index(close.index)
+                close = pd.Series(close.values, index=close_index).dropna()
+                volume = pd.Series(volume.values, index=_eastern_index(volume.index)).fillna(0) if not volume.empty else pd.Series(dtype=float)
+
+                if session_name == "premarket":
+                    mask = (
+                        (close.index.date == today)
+                        & (close.index.time >= clock_time(4, 0))
+                        & (close.index.time < clock_time(9, 30))
+                    )
+                else:
+                    mask = (
+                        (close.index.date == today)
+                        & (close.index.time >= clock_time(16, 0))
+                        & (close.index.time < clock_time(20, 0))
+                    )
+
+                session_close = close[mask]
+                if session_close.empty:
+                    continue
+
+                latest_price = float(session_close.iloc[-1])
+                daily_index = _eastern_index(daily_close.index)
+                daily_series = pd.Series(daily_close.values, index=daily_index).dropna()
+                if session_name == "premarket":
+                    prior = daily_series[daily_series.index.date < today]
+                else:
+                    prior = daily_series[daily_series.index.date <= today]
+                if prior.empty:
+                    continue
+                previous_close = float(prior.iloc[-1])
+                if previous_close <= 0:
+                    continue
+
+                if not volume.empty:
+                    session_volume = float(volume.reindex(session_close.index).fillna(0).sum())
+                else:
+                    session_volume = 0.0
+
+                results[symbol] = {
+                    "session_price": latest_price,
+                    "session_change_percent": ((latest_price / previous_close) - 1) * 100,
+                    "session_volume": session_volume,
+                }
+            except Exception:
+                continue
+
+    return results
+
+
+def rank_market_scan_candidates(candidate_items, session_name, deep_limit=24):
+    """Quickly rank a broad pool, then return a practical deep-analysis set."""
+    items = [dict(item) for item in candidate_items]
+
+    if session_name in {"premarket", "afterhours"}:
+        extended = get_extended_session_metrics(
+            tuple(item["ticker"] for item in items),
+            session_name,
+        )
+        for item in items:
+            if item["ticker"] in extended:
+                item.update(extended[item["ticker"]])
+                session_source = "Extended-hours data"
+                if session_source not in item["sources"]:
+                    item["sources"].append(session_source)
+
+    ranked = []
+    fallback = []
+    for item in items:
+        price = item.get("session_price")
+        change = item.get("session_change_percent")
+        volume = item.get("session_volume")
+
+        if price is not None and price < 3:
+            continue
+        if change is None:
+            fallback.append(item)
+            continue
+
+        minimum_volume = 20_000 if session_name in {"premarket", "afterhours"} else 500_000
+        if volume is not None and volume < minimum_volume:
+            continue
+
+        liquidity_component = math.log10(max(float(volume or 1), 1))
+        item["quick_rank"] = abs(float(change)) * 2.0 + liquidity_component * 0.35
+        ranked.append(item)
+
+    ranked.sort(key=lambda item: item.get("quick_rank", 0), reverse=True)
+    selected = ranked[:deep_limit]
+
+    if len(selected) < deep_limit:
+        selected_symbols = {item["ticker"] for item in selected}
+        for item in fallback:
+            if item["ticker"] not in selected_symbols:
+                selected.append(item)
+                selected_symbols.add(item["ticker"])
+            if len(selected) >= deep_limit:
+                break
+
+    return selected, {
+        "pool_count": len(items),
+        "ranked_count": len(ranked),
+        "deep_count": len(selected),
+        "session_name": session_name,
+    }
+
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_finder_validation_history(ticker):
+    """Load enough adjusted history to validate a current finder direction."""
+    history = yf.Ticker(ticker).history(period="5y", auto_adjust=True)
+    return history.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_current_ticker_macro_assessment(ticker, direction):
+    """Return current ticker-aware macro alignment for a proposed direction."""
+    classification = resolve_ticker_macro_profile(ticker, "Auto by ticker")
+    plan = build_ticker_factor_plan(classification, oil_threshold=0.02)
+    requested = tuple(sorted({factor["key"] for factor in plan}))
+    start_date = (pd.Timestamp.now(tz="America/New_York") - pd.DateOffset(days=260)).date().isoformat()
+    history = load_macro_history(start_date, requested)
+    context = build_macro_context(history, lookback_days=5)
+    table, score = build_current_factor_table(context, plan)
+
+    if direction == "LONG":
+        alignment = "Supportive" if score >= 2 else "Opposing" if score <= -2 else "Neutral"
+    else:
+        alignment = "Supportive" if score <= -2 else "Opposing" if score >= 2 else "Neutral"
+
+    relevant = table[table["Weight"] != "Ignored"] if not table.empty else table
+    support = relevant[relevant["Current effect"] == "Supportive"]["Factor"].tolist()
+    risks = relevant[relevant["Current effect"] == "Negative"]["Factor"].tolist()
+    return {
+        "alignment": alignment,
+        "score": int(score),
+        "profile": classification["profile"],
+        "support": support[:3],
+        "risks": risks[:3],
+    }
+
+
+def validate_finder_candidate(snapshot):
+    """Turn a technical lean into a final verdict using history and macro context."""
+    result = dict(snapshot)
+    setup = result["setup"]
+    direction = result.get("direction")
+
+    if not direction:
+        result["validation"] = {
+            "final_verdict": "NO TRADE",
+            "verdict_kind": "info",
+            "historical_label": "No directional test",
+            "macro_alignment": "Neutral",
+            "final_score": 0,
+            "reasons": ["The technical indicators do not agree on a direction."],
+            "statistics": None,
+        }
+        return result
+
+    history = load_finder_validation_history(result["ticker"])
+    start_date = (pd.Timestamp.now(tz="America/New_York") - pd.DateOffset(years=4)).date()
+    trades, prepared = run_strategy_backtest(
+        history,
+        test_start_date=start_date,
+        holding_days=3,
+        minimum_quality=60,
+        cost_bps_per_side=7.5,
+        stop_atr_multiple=1.25,
+        reward_to_risk=2.0,
+    )
+    direction_trades = trades[trades["Direction"] == direction].copy() if not trades.empty else trades
+    statistics = calculate_backtest_statistics(direction_trades, prepared)
+    edge = evaluate_backtest_edge(statistics)
 
     try:
-        backtest_trades, prepared_backtest_history = (
-            run_strategy_backtest(
-                data=backtest_history,
-                test_start_date=(
-                    backtest_start_timestamp.date()
-                ),
-                holding_days=backtest_holding_days,
-                minimum_quality=(
-                    backtest_minimum_quality
-                ),
-                cost_bps_per_side=backtest_cost_bps,
-            )
+        macro = get_current_ticker_macro_assessment(result["ticker"], direction)
+    except Exception:
+        macro = {
+            "alignment": "Unavailable",
+            "score": 0,
+            "profile": "Unknown",
+            "support": [],
+            "risks": [],
+        }
+
+    rr = float((result.get("plan") or {}).get("reward_to_risk") or 0.0)
+    final_score = int(setup["setup_quality"]) + int(edge["score"])
+    final_score += 8 if macro["alignment"] == "Supportive" else -12 if macro["alignment"] == "Opposing" else 0
+    final_score += 5 if rr >= 1.5 else -8
+
+    if edge["grade"] in {"STRONG", "MODERATE"} and setup["setup_quality"] >= 70 and macro["alignment"] != "Opposing" and rr >= 1.5:
+        final_verdict = f"{direction} CANDIDATE"
+        verdict_kind = "success"
+    elif edge["grade"] == "NEGATIVE":
+        final_verdict = "WAIT — HISTORICAL EDGE FAILED"
+        verdict_kind = "error"
+    elif macro["alignment"] == "Opposing":
+        final_verdict = "WAIT — MACRO CONFLICT"
+        verdict_kind = "warning"
+    elif edge["grade"] == "INSUFFICIENT":
+        final_verdict = "WATCH — EDGE UNPROVEN"
+        verdict_kind = "warning"
+    else:
+        final_verdict = "WATCH / WAIT"
+        verdict_kind = "warning"
+
+    reasons = [
+        f"Technical lean: {direction} with setup quality {setup['setup_quality']}/100.",
+        f"Historical test: {edge['label']}. {edge['reason']}",
+        f"Ticker-aware macro context: {macro['alignment']} ({macro['profile']} profile).",
+        f"Planned reward-to-risk: {rr:.1f}:1." if rr else "No valid reward-to-risk plan was available.",
+    ]
+    if statistics:
+        oos = statistics.get("out_of_sample") or {}
+        reasons.append(
+            f"After costs: {statistics['total_trades']} {direction.lower()} trades, "
+            f"{statistics['win_rate']:.1%} wins, {statistics['average_return']:+.2%} average, "
+            f"profit factor {statistics['profit_factor']:.2f}."
         )
-
-        backtest_statistics = (
-            calculate_backtest_statistics(
-                backtest_trades,
-                prepared_backtest_history,
+        if oos:
+            reasons.append(
+                f"Out-of-sample: {int(oos['trades'])} trades with "
+                f"{float(oos['average_return']):+.2%} average return."
             )
-        )
+    if macro.get("support"):
+        reasons.append("Macro support: " + ", ".join(macro["support"]) + ".")
+    if macro.get("risks"):
+        reasons.append("Macro risks: " + ", ".join(macro["risks"]) + ".")
 
-    except Exception as error:
-        backtest_trades = pd.DataFrame()
-        prepared_backtest_history = pd.DataFrame()
-        backtest_statistics = None
-        backtest_error = str(error)
+    result["validation"] = {
+        "final_verdict": final_verdict,
+        "verdict_kind": verdict_kind,
+        "historical_label": edge["label"],
+        "historical_grade": edge["grade"],
+        "macro_alignment": macro["alignment"],
+        "macro_profile": macro["profile"],
+        "final_score": final_score,
+        "reasons": reasons,
+        "statistics": statistics,
+    }
+    return result
 
-    (
-        trade_tab,
-        backtest_tab,
-        summary_tab,
-        price_tab,
-        momentum_tab,
-        watchlist_tab,
-        news_tab,
-    ) = st.tabs(
-        [
-            "Decision",
-            "Backtest",
-            "Snapshot",
-            "Chart",
-            "Momentum",
-            "Watchlist",
-            "News",
-        ]
+
+
+def render_trade_finder():
+    st.header("Find a Trade")
+    st.caption(
+        "The scanner first finds movers, then validates only the strongest technical leans "
+        "with a direction-specific historical test and ticker-aware macro context."
     )
 
-    with trade_tab:
-        st.subheader(f"Decision for {ticker}")
-        st.caption(
-            "Use this as a decision aid: trade only when the setup, "
-            "entry, risk, and current news all make sense together."
+    session = get_market_session()
+    st.caption(
+        f"**Current scanner session: {session['label']}.** "
+        + (
+            "Extended-hours prices and volume are used from 4:00–9:30 AM ET."
+            if session["name"] == "premarket"
+            else "Live regular-session mover data is used."
+            if session["name"] == "regular"
+            else "Extended-hours prices and volume are used from 4:00–8:00 PM ET."
+            if session["name"] == "afterhours"
+            else "The latest available regular-session screens are used until premarket opens."
         )
+    )
 
-        quote_title_column, quote_refresh_column = st.columns(
-            [4, 1]
-        )
+    scan_mode = st.radio(
+        "Finder mode",
+        ["Scan the Market", "Scan My List"],
+        key="finder_scan_mode",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-        quote_title_column.markdown("### Latest market price")
+    with st.container(border=True):
+        if scan_mode == "Scan the Market":
+            st.markdown("### Search current market movers")
+            st.caption(
+                "Collects a broad pool, pre-ranks it with current-session data, deeply analyzes "
+                "24 names, then validates the strongest eight."
+            )
+            scan_clicked = st.button("Scan the Market", type="primary", use_container_width=True)
+        else:
+            st.markdown("### Search tickers you choose")
+            finder_watchlist = st.text_input(
+                "Tickers to scan",
+                "AAL, INTC, BA, KO, CVX, XOM, NVDA, AMD",
+                help="Separate ticker symbols with commas. Up to 12.",
+            )
+            scan_clicked = st.button("Scan My List", type="primary", use_container_width=True)
 
-        if quote_refresh_column.button(
-            "Refresh price",
-            key=f"refresh_decision_quote_{ticker}",
-            use_container_width=True,
-        ):
-            get_latest_quote.clear()
-            get_latest_trade_price.clear()
-            st.rerun()
-
-        try:
-            latest_quote = get_latest_quote(ticker)
-        except Exception:
-            latest_quote = {
-                "price": None,
-                "previous_close": None,
-                "change": None,
-                "change_percent": None,
-                "updated_at": None,
+    if scan_clicked:
+        status = st.empty()
+        if scan_mode == "Scan the Market":
+            status.caption("Collecting a broad online mover pool…")
+            scan_payload = get_market_scan_candidates(max_pool=220)
+            status.caption(
+                f"Pre-ranking {len(scan_payload['candidates'])} candidates using "
+                f"{scan_payload['session_label'].lower()} data…"
+            )
+            candidate_items, scan_summary = rank_market_scan_candidates(
+                scan_payload["candidates"],
+                scan_payload["session_name"],
+                deep_limit=24,
+            )
+            scan_summary["session_label"] = scan_payload["session_label"]
+            st.session_state.finder_scan_summary = scan_summary
+        else:
+            symbols = parse_watchlist(finder_watchlist, "")[:12]
+            candidate_items = [
+                {
+                    "ticker": symbol,
+                    "sources": ["My list"],
+                    "session_price": None,
+                    "session_change_percent": None,
+                    "session_volume": None,
+                }
+                for symbol in symbols
+            ]
+            st.session_state.finder_scan_summary = {
+                "pool_count": len(candidate_items),
+                "ranked_count": len(candidate_items),
+                "deep_count": len(candidate_items),
+                "session_name": session["name"],
+                "session_label": session["label"],
             }
 
-        latest_market_price = latest_quote.get("price")
-        latest_change = latest_quote.get("change")
-        latest_change_percent = latest_quote.get("change_percent")
+        if not candidate_items:
+            status.empty()
+            st.session_state.finder_results = []
+            st.warning("No candidate tickers were returned.")
+        else:
+            results = []
+            progress = st.progress(0)
+            for index, candidate in enumerate(candidate_items):
+                symbol = candidate["ticker"]
+                status.caption(f"Technical analysis {index + 1} of {len(candidate_items)} — {symbol}")
+                try:
+                    snapshot = build_stock_snapshot(symbol, "1y")
+                    snapshot["finder_sources"] = candidate.get("sources", [])
+                    snapshot["session_change_percent"] = candidate.get("session_change_percent")
+                    snapshot["session_volume"] = candidate.get("session_volume")
+                    results.append(snapshot)
+                except Exception as error:
+                    results.append({"ticker": symbol, "finder_sources": candidate.get("sources", []), "error": str(error)})
+                progress.progress((index + 1) / max(len(candidate_items), 1))
+
+            usable = [item for item in results if "error" not in item]
+            validation_pool = sorted(
+                [item for item in usable if item.get("direction") and item["setup"]["setup_quality"] >= 55],
+                key=lambda item: item["setup"]["setup_quality"],
+                reverse=True,
+            )[:8]
+            validation_symbols = {item["ticker"] for item in validation_pool}
+
+            for index, candidate in enumerate(validation_pool):
+                status.caption(
+                    f"Historical and macro validation {index + 1} of {len(validation_pool)} — {candidate['ticker']}"
+                )
+                try:
+                    validated = validate_finder_candidate(candidate)
+                    for position, existing in enumerate(results):
+                        if existing.get("ticker") == candidate["ticker"]:
+                            results[position] = validated
+                            break
+                except Exception as error:
+                    candidate["validation"] = {
+                        "final_verdict": "WATCH — VALIDATION UNAVAILABLE",
+                        "verdict_kind": "warning",
+                        "historical_label": "Validation unavailable",
+                        "macro_alignment": "Unavailable",
+                        "final_score": candidate["setup"]["setup_quality"] - 10,
+                        "reasons": [f"Validation could not be completed: {error}"],
+                        "statistics": None,
+                    }
+
+            for item in usable:
+                if item["ticker"] not in validation_symbols:
+                    item["validation"] = {
+                        "final_verdict": "NOT FULLY VALIDATED",
+                        "verdict_kind": "info",
+                        "historical_label": "Outside validation shortlist",
+                        "macro_alignment": "Not checked",
+                        "final_score": item["setup"]["setup_quality"] - 15,
+                        "reasons": ["This ticker did not rank in the top eight technical leans, so the slower historical validation was skipped."],
+                        "statistics": None,
+                    }
+
+            progress.empty()
+            status.empty()
+            st.session_state.finder_results = results
+
+    results = st.session_state.finder_results
+    scan_summary = st.session_state.get("finder_scan_summary")
+    if scan_summary:
+        st.caption(
+            f"Last scan: {scan_summary.get('session_label', 'Market')} • "
+            f"{scan_summary.get('pool_count', 0)} candidates collected • "
+            f"{scan_summary.get('ranked_count', 0)} had usable mover data • "
+            f"{scan_summary.get('deep_count', 0)} technically analyzed • up to 8 historically validated."
+        )
+
+    if not results:
+        st.info("Choose a scan mode and press its scan button.")
+        return
+
+    usable = [item for item in results if "error" not in item]
+    candidates = [
+        item for item in usable
+        if "CANDIDATE" in (item.get("validation") or {}).get("final_verdict", "")
+    ]
+    candidates.sort(key=lambda item: item["validation"]["final_score"], reverse=True)
+
+    if not candidates:
+        st.info(
+            "No historically verified trade candidate was found. Some charts may lean long or short, "
+            "but the app is recommending Watch or Wait rather than overstating the evidence."
+        )
+        display_items = sorted(
+            [item for item in usable if item.get("validation")],
+            key=lambda item: item["validation"]["final_score"],
+            reverse=True,
+        )[:3]
+        heading = "Closest watchlist setups"
+    else:
+        display_items = candidates[:3]
+        heading = "Verified current candidates"
+
+    st.subheader(heading)
+    for rank, item in enumerate(display_items, start=1):
+        setup = item["setup"]
+        quote = item["quote"]
+        plan = item["plan"]
+        validation = item["validation"]
+        sources = ", ".join(item.get("finder_sources") or [])
+        session_change = item.get("session_change_percent")
 
         with st.container(border=True):
-            quote_metric_1, quote_metric_2, quote_metric_3 = st.columns(3)
-
-            if latest_market_price is None:
-                quote_metric_1.metric("Latest price", "Unavailable")
-            else:
-                quote_metric_1.metric(
-                    f"{ticker} latest price",
-                    f"${latest_market_price:,.2f}",
-                )
-
-            if (
-                latest_change is not None
-                and latest_change_percent is not None
-            ):
-                quote_metric_2.metric(
-                    "Change vs prior close",
-                    f"${latest_change:+.2f}",
-                    f"{latest_change_percent:+.2f}%",
-                )
-            else:
-                quote_metric_2.metric(
-                    "Change vs prior close",
-                    "Unavailable",
-                )
-
-            quote_metric_3.metric(
-                "Quote updated",
-                latest_quote.get("updated_at") or "Unavailable",
-            )
-
-            st.caption(
-                "Yahoo Finance estimate. Exchange data may be delayed. "
-                "The technical score below still uses daily indicator data."
-            )
-
-        suggested_direction = None
-        suggested_plan = None
-
-        if trade_setup["bias"] != "WAIT":
-            suggested_direction = (
-                "LONG"
-                if trade_setup["bias"] == "LONG BIAS"
-                else "SHORT"
-            )
-
-            entry_anchor = st.session_state.analysis_entry_anchors.get(
-                ticker
-            )
-
-            if entry_anchor is None:
-                entry_anchor = latest_market_price or price
-
-            suggested_plan = build_suggested_trade_plan(
-                ticker=ticker,
-                direction=suggested_direction,
-                fallback_price=price,
-                atr_14=atr_14,
-                entry_price_override=entry_anchor,
-            )
-
-            if latest_market_price is not None:
-                planned_entry = float(suggested_plan["entry"])
-                risk_per_share = max(
-                    float(suggested_plan["risk_per_share"]),
-                    0.01,
-                )
-
-                if suggested_direction == "LONG":
-                    movement_from_entry = (
-                        latest_market_price - planned_entry
-                    )
-                else:
-                    movement_from_entry = (
-                        planned_entry - latest_market_price
-                    )
-
-                movement_percent = (
-                    movement_from_entry / planned_entry
-                ) * 100
-                movement_in_r = movement_from_entry / risk_per_share
-
-                entry_distance_column_1, entry_distance_column_2 = (
-                    st.columns(2)
-                )
-                entry_distance_column_1.metric(
-                    "Planned entry",
-                    f"${planned_entry:.2f}",
-                )
-                entry_distance_column_2.metric(
-                    "Price vs planned entry",
-                    f"{movement_percent:+.2f}%",
-                    f"{movement_in_r:+.2f} R",
-                )
-
-                if movement_in_r >= 0.50:
-                    st.warning(
-                        "Price has moved materially beyond the planned "
-                        "entry. Avoid chasing without recalculating the "
-                        "stop, target, and reward-to-risk."
-                    )
-                elif movement_in_r >= 0.20:
-                    st.info(
-                        "Price has moved somewhat beyond the planned "
-                        "entry. Review the trade levels before entering."
-                    )
-                elif movement_in_r <= -0.50:
-                    st.warning(
-                        "Price is materially better than the planned entry, "
-                        "but verify that the setup has not weakened."
-                    )
-                else:
-                    st.success(
-                        "The latest price remains close to the planned entry."
-                    )
-
-        st.divider()
-
-        bias_column, quality_column, status_column = st.columns(3)
-
-        bias_column.metric(
-            "Technical direction",
-            trade_setup["bias"],
-        )
-
-        quality_column.metric(
-            "Setup quality",
-            f"{trade_setup['setup_quality']} / 100",
-        )
-
-        status_column.metric(
-            "Trade opportunity",
-            trade_setup["trade_status"],
-        )
-
-        direction_score = trade_setup["direction_score"]
-
-        st.write(
-            f"Directional score: **{direction_score:+d} out of 7**"
-        )
-
-        st.progress(
-            trade_setup["setup_quality"] / 100
-        )
-        st.caption(
-            "The bar measures technical signal agreement, not the "
-            "chance that a trade will make money."
-        )
-
-        if trade_setup["trade_status"] == "POTENTIAL TRADE SETUP":
-            if trade_setup["bias"] == "LONG BIAS":
-                st.success(
-                    "Possible long setup to investigate. "
-                    + trade_setup["status_text"]
-                )
-            else:
-                st.error(
-                    "Possible short setup to investigate. "
-                    + trade_setup["status_text"]
-                )
-
-        elif trade_setup["trade_status"] == "WATCH FOR CONFIRMATION":
-            st.warning(trade_setup["status_text"])
-
-        else:
-            st.info(trade_setup["status_text"])
-
-        with st.expander("Why the dashboard gave this reading"):
-            for reason in trade_setup["evidence"]:
-                st.write(f"• {reason}")
-
-        with st.expander("Risk flags"):
-            if trade_setup["risk_flags"]:
-                for warning in trade_setup["risk_flags"]:
-                    st.write(f"• {warning}")
-            else:
+            st.markdown(f"### {rank}. {item['ticker']} — {validation['final_verdict']}")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                render_summary_card("Technical lean", item.get("direction") or "WAIT")
+            with c2:
+                render_summary_card("Setup", f"{setup['setup_quality']} / 100")
+            with c3:
+                render_summary_card("Historical edge", validation["historical_label"])
+            with c4:
+                render_summary_card("Macro", validation["macro_alignment"])
+            if quote.get("price"):
                 st.write(
-                    "• No major indicator-stretch warnings were detected."
+                    f"**Latest:** ${quote['price']:.2f}"
+                    + (f" • **Session:** {session_change:+.2f}%" if session_change is not None else "")
                 )
-
-        st.divider()
-        st.subheader("Enter this analyzed trade")
-
-        if trade_setup["bias"] == "WAIT":
-            st.info(
-                "One-click entry is unavailable because the current "
-                "analysis does not have a clear long or short direction."
-            )
-        elif not logged_in:
-            st.info(
-                "Sign in from the sidebar to save this setup as an "
-                "active trade."
-            )
-        else:
-            if suggested_direction is None or suggested_plan is None:
-                suggested_direction = (
-                    "LONG"
-                    if trade_setup["bias"] == "LONG BIAS"
-                    else "SHORT"
+            if sources:
+                st.caption(f"Found through: {sources}")
+            if plan:
+                st.write(
+                    f"**Hypothetical plan:** Entry ${plan['entry']:.2f} • Stop ${plan['stop']:.2f} • "
+                    f"Target ${plan['target']:.2f} • R:R {plan['reward_to_risk']:.1f}:1"
                 )
-                suggested_plan = build_suggested_trade_plan(
-                    ticker=ticker,
-                    direction=suggested_direction,
-                    fallback_price=price,
-                    atr_14=atr_14,
-                    entry_price_override=(
-                        latest_market_price or price
-                    ),
-                )
-
-            if trade_setup["trade_status"] != "POTENTIAL TRADE SETUP":
-                st.warning(
-                    "This is a directional lean, not a fully confirmed "
-                    "setup. Review the levels and current news before "
-                    "recording an entry."
-                )
-
-            plan_metric_1, plan_metric_2, plan_metric_3 = st.columns(3)
-
-            plan_metric_1.metric(
-                "Suggested direction",
-                suggested_direction,
-            )
-            plan_metric_2.metric(
-                "Estimated entry",
-                f"${suggested_plan['entry']:.2f}",
-            )
-            plan_metric_3.metric(
-                "Default reward-to-risk",
-                f"{suggested_plan['reward_to_risk']:.1f} : 1",
+            for reason in validation["reasons"][:3]:
+                st.write(f"• {reason}")
+            st.button(
+                "View Decision",
+                key=f"finder_view_{item['ticker']}",
+                type="primary" if rank == 1 else "secondary",
+                use_container_width=True,
+                on_click=open_analysis_for,
+                args=(item["ticker"],),
             )
 
-            st.caption(
-                "The default stop uses about 1.25 times the 14-day ATR. "
-                "The target is set at twice the dollars risked per share. "
-                "All fields remain editable so you can enter your actual fill."
+    with st.expander("All deeply analyzed results"):
+        rows = []
+        for item in usable:
+            validation = item.get("validation") or {}
+            rows.append(
+                {
+                    "Ticker": item["ticker"],
+                    "Source": ", ".join(item.get("finder_sources") or []),
+                    "Session move": f"{item.get('session_change_percent'):+.2f}%" if item.get("session_change_percent") is not None else "—",
+                    "Technical lean": item.get("direction") or "WAIT",
+                    "Setup": item["setup"]["setup_quality"],
+                    "Final verdict": validation.get("final_verdict", "Not validated"),
+                    "Historical edge": validation.get("historical_label", "—"),
+                    "Macro": validation.get("macro_alignment", "—"),
+                }
+            )
+        if rows:
+            st.dataframe(
+                pd.DataFrame(rows).sort_values(["Setup", "Ticker"], ascending=[False, True]),
+                hide_index=True,
+                use_container_width=True,
             )
 
-            with st.form(
-                f"decision_entry_form_{ticker}_{suggested_direction}"
+
+def render_analyze():
+    pending_ticker = st.session_state.get("pending_analysis_ticker")
+
+    if pending_ticker:
+        try:
+            with st.spinner(f"Opening and validating {pending_ticker} decision…"):
+                snapshot = build_stock_snapshot(pending_ticker, "1y")
+                st.session_state.analysis_result = validate_finder_candidate(snapshot)
+        except Exception as error:
+            st.session_state.analysis_result = None
+            st.error(f"Decision could not be opened: {error}")
+        finally:
+            st.session_state.pending_analysis_ticker = None
+
+    result = st.session_state.analysis_result
+    direct_decision = bool(st.session_state.get("decision_from_finder") and result)
+
+    if direct_decision:
+        navigation_1, navigation_2 = st.columns(2)
+        navigation_1.button("← Back to Trade Finder", use_container_width=True, on_click=return_to_trade_finder)
+        navigation_2.button("Analyze another ticker", use_container_width=True, on_click=analyze_another_stock)
+        st.header(f"Decision for {result['ticker']}")
+        st.caption("Opened directly from Trade Finder with its historical and macro validation preserved.")
+    else:
+        st.header("Analyze a Stock")
+        st.caption("The app separates the current technical lean from the evidence-based final verdict.")
+        with st.form("clean_analysis_form"):
+            ticker = st.text_input("Ticker", key="analyze_ticker_input").strip().upper()
+            analyze_clicked = st.form_submit_button("Analyze stock", type="primary", use_container_width=True)
+        if analyze_clicked:
+            st.session_state.decision_from_finder = False
+            try:
+                with st.spinner(f"Analyzing and validating {ticker}…"):
+                    snapshot = build_stock_snapshot(ticker, "1y")
+                    st.session_state.analysis_result = validate_finder_candidate(snapshot)
+            except Exception as error:
+                st.session_state.analysis_result = None
+                st.error(f"Analysis failed: {error}")
+        result = st.session_state.analysis_result
+
+    if not result:
+        st.info("Enter a ticker and press Analyze stock.")
+        return
+
+    ticker = result["ticker"]
+    setup = result["setup"]
+    quote = result["quote"]
+    plan = result["plan"]
+    validation = result.get("validation") or {
+        "final_verdict": "TECHNICAL VIEW ONLY",
+        "verdict_kind": "info",
+        "historical_label": "Not validated",
+        "macro_alignment": "Not checked",
+        "reasons": [],
+        "statistics": None,
+    }
+    final_is_candidate = "CANDIDATE" in validation["final_verdict"]
+
+    with st.container(border=True):
+        st.markdown(f"### Final verdict: {validation['final_verdict']}")
+        top1, top2, top3, top4 = st.columns(4)
+        with top1:
+            render_summary_card("Latest price", f"${quote['price']:.2f}" if quote.get("price") else "Unavailable")
+        with top2:
+            render_summary_card("Technical lean", result.get("direction") or "WAIT")
+        with top3:
+            render_summary_card("Setup", f"{setup['setup_quality']} / 100")
+        with top4:
+            render_summary_card("Historical edge", validation["historical_label"])
+        st.write(f"**Ticker-aware macro:** {validation['macro_alignment']}")
+
+        for reason in validation.get("reasons", [])[:4]:
+            st.write(f"• {reason}")
+
+        if plan:
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Direction", result["direction"])
+            p2.metric("Entry", f"${plan['entry']:.2f}")
+            p3.metric("Stop", f"${plan['stop']:.2f}")
+            p4.metric("Target", f"${plan['target']:.2f}")
+            if not final_is_candidate:
+                st.caption("These levels are a hypothetical risk plan, not an app recommendation to enter.")
+
+    if plan and final_is_candidate and logged_in:
+        try:
+            live_quote = get_latest_quote(ticker)
+            live_price = float(live_quote.get("price"))
+        except Exception:
+            live_quote = quote
+            live_price = None
+
+        recommended_entry = float(plan["entry"])
+        original_entry_waiting = entry_is_waiting(
+            result["direction"],
+            recommended_entry,
+            live_price,
+        )
+
+        if original_entry_waiting and live_price is not None:
+            st.warning(
+                f"The original entry has not filled. Current price: ${live_price:.2f}. "
+                f"Recommended entry: ${recommended_entry:.2f}. Do not chase without "
+                "creating a new setup."
+            )
+
+            if st.button(
+                "Recalculate setup from current price",
+                use_container_width=True,
+                key=f"recalculate_plan_{ticker}_{result['direction']}",
             ):
-                entry_column_1, entry_column_2 = st.columns(2)
+                refreshed_plan = build_suggested_trade_plan(
+                    ticker=ticker,
+                    direction=result["direction"],
+                    fallback_price=result["close"],
+                    atr_14=result["atr"],
+                    entry_price_override=live_price,
+                )
+                st.session_state.analysis_result["plan"] = refreshed_plan
+                st.session_state.analysis_result["quote"] = live_quote
+                st.rerun()
 
-                with entry_column_1:
-                    decision_quantity = st.number_input(
+        with st.expander("Paper trade or filled trade", expanded=True):
+            st.caption(
+                "Entry, stop, and target are editable. When Paper trade is checked, "
+                "the app saves an unfilled entry as Pending and a currently fillable "
+                "entry as Active."
+            )
+            st.caption(
+                f"Original scanner plan — Entry ${plan['entry']:.2f} · "
+                f"Stop ${plan['stop']:.2f} · Target ${plan['target']:.2f}"
+            )
+
+            with st.form(f"editable_decision_entry_{ticker}_{result['direction']}"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    quantity = st.number_input(
                         "Shares",
                         min_value=1,
                         value=1,
                         step=1,
-                        key=f"decision_quantity_{ticker}",
+                        key=f"editable_qty_{ticker}_{result['direction']}",
                     )
-
-                    decision_entry = st.number_input(
-                        "Actual or planned entry",
+                    entry = st.number_input(
+                        "Entry price",
                         min_value=0.01,
-                        value=float(suggested_plan["entry"]),
+                        value=float(plan["entry"]),
                         step=0.01,
                         format="%.2f",
-                        key=f"decision_entry_{ticker}",
+                        key=f"editable_entry_{ticker}_{result['direction']}",
                     )
-
-                with entry_column_2:
-                    decision_stop = st.number_input(
+                    paper_trade = st.checkbox(
+                        "Paper trade",
+                        value=True,
+                        key=f"editable_paper_{ticker}_{result['direction']}",
+                    )
+                with c2:
+                    stop = st.number_input(
                         "Stop loss",
                         min_value=0.01,
-                        value=float(suggested_plan["stop"]),
+                        value=float(plan["stop"]),
                         step=0.01,
                         format="%.2f",
-                        key=f"decision_stop_{ticker}",
+                        key=f"editable_stop_{ticker}_{result['direction']}",
                     )
-
-                    decision_target = st.number_input(
+                    target = st.number_input(
                         "Target price",
                         min_value=0.01,
-                        value=float(suggested_plan["target"]),
+                        value=float(plan["target"]),
                         step=0.01,
                         format="%.2f",
-                        key=f"decision_target_{ticker}",
+                        key=f"editable_target_{ticker}_{result['direction']}",
                     )
 
-                decision_add_clicked = st.form_submit_button(
-                    "Enter this trade",
+                save_clicked = st.form_submit_button(
+                    "Save paper trade / order" if paper_trade else "Record filled trade",
                     type="primary",
                     use_container_width=True,
                 )
 
-            if decision_add_clicked:
-                long_prices_invalid = (
-                    suggested_direction == "LONG"
-                    and not (
-                        decision_stop
-                        < decision_entry
-                        < decision_target
-                    )
+            if save_clicked:
+                direction = result["direction"]
+                levels_valid = (
+                    stop < entry < target
+                    if direction == "LONG"
+                    else target < entry < stop
                 )
 
-                short_prices_invalid = (
-                    suggested_direction == "SHORT"
-                    and not (
-                        decision_target
-                        < decision_entry
-                        < decision_stop
-                    )
-                )
-
-                if long_prices_invalid:
+                if not levels_valid:
                     st.error(
-                        "For a long trade, the stop must be below the "
-                        "entry and the target must be above it."
-                    )
-                elif short_prices_invalid:
-                    st.error(
-                        "For a short trade, the target must be below the "
-                        "entry and the stop must be above it."
+                        "Check the levels. For a long trade: stop < entry < target. "
+                        "For a short trade: target < entry < stop."
                     )
                 else:
                     try:
-                        add_cloud_trade(
-                            supabase,
-                            st.session_state.supabase_user_id,
-                            {
-                                "ticker": ticker,
-                                "direction": suggested_direction,
-                                "quantity": int(decision_quantity),
-                                "entry": float(decision_entry),
-                                "stop": float(decision_stop),
-                                "target": float(decision_target),
-                            },
-                        )
-                        get_latest_quote.clear()
-                        get_latest_trade_price.clear()
-                        st.success(
-                            f"{ticker} was added to Active Trades."
-                        )
-                        st.rerun()
-                    except Exception as error:
-                        st.error(f"Trade could not be saved: {error}")
+                        submit_quote = get_latest_quote(ticker)
+                        submit_price = float(submit_quote.get("price"))
+                    except Exception:
+                        submit_price = None
 
-        st.warning(
-            "This score measures indicator agreement, not the probability "
-            "of making money. It does not know your entry, stop loss, "
-            "position size, breaking news, or personal risk tolerance."
-        )
+                    waiting = (
+                        True
+                        if submit_price is None
+                        else entry_is_waiting(direction, entry, submit_price)
+                    )
 
-    with backtest_tab:
-        st.subheader(
-            f"{ticker} Backtesting Lab"
-        )
+                    if paper_trade and waiting:
+                        try:
+                            add_pending_paper_order(
+                                supabase,
+                                st.session_state.supabase_user_id,
+                                {
+                                    "ticker": ticker,
+                                    "direction": direction,
+                                    "quantity": int(quantity),
+                                    "entry": float(entry),
+                                    "stop": float(stop),
+                                    "target": float(target),
+                                },
+                            )
+                            price_note = (
+                                f" Current price: ${submit_price:.2f}."
+                                if submit_price is not None
+                                else " Live price was unavailable, so it was kept Pending."
+                            )
+                            st.success(
+                                f"Pending paper order saved for {ticker} at "
+                                f"${float(entry):.2f}.{price_note}"
+                            )
+                        except Exception as error:
+                            st.error(f"Pending order could not be saved: {error}")
+                    elif not paper_trade and waiting:
+                        st.error(
+                            "That entry has not filled at the current market price. "
+                            "Use Paper trade to save it as Pending, or record the actual "
+                            "filled price."
+                        )
+                    else:
+                        try:
+                            add_cloud_trade(
+                                supabase,
+                                st.session_state.supabase_user_id,
+                                {
+                                    "ticker": ticker,
+                                    "direction": direction,
+                                    "quantity": int(quantity),
+                                    "entry": float(entry),
+                                    "stop": float(stop),
+                                    "target": float(target),
+                                    "notes": (
+                                        "PAPER TRADE | Entry currently fillable"
+                                        if paper_trade
+                                        else "Manually recorded filled trade"
+                                    ),
+                                },
+                            )
+                            st.success(
+                                f"{ticker} was added to Active Trades at "
+                                f"${float(entry):.2f}."
+                            )
+                        except Exception as error:
+                            st.error(f"Trade could not be saved: {error}")
 
         st.caption(
-            "This test recalculates the dashboard's indicators "
-            "using only information available at each historical "
-            "close. It enters at the next trading day's open and "
-            f"exits after {backtest_holding_days} trading "
-            "session(s)."
+            "Pending paper orders are checked whenever Active Trades loads or "
+            "you press Refresh & check orders. The app cannot monitor while it "
+            "is completely closed."
+        )
+    elif plan and not final_is_candidate:
+        st.info("Trade entry is withheld because the final evidence does not confirm this setup. You can still add a trade manually from Active Trades.")
+    elif plan and not logged_in:
+        st.info("Sign in from the sidebar to save a verified trade.")
+
+    with st.expander("Full decision evidence"):
+        st.markdown("**Current technical evidence**")
+        for reason in setup["evidence"]:
+            st.write(f"• {reason}")
+        if setup["risk_flags"]:
+            st.markdown("**Technical risk flags**")
+            for flag in setup["risk_flags"]:
+                st.write(f"• {flag}")
+        stats = validation.get("statistics")
+        if stats:
+            st.markdown("**Historical validation**")
+            st.dataframe(
+                pd.DataFrame([build_strategy_comparison_row(f"{result.get('direction')} signals", stats)]),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "The last 30% of trades are held out as a chronological out-of-sample check. "
+                "Buy-and-hold is always invested; the strategy exposure is shown separately."
+            )
+
+    with st.expander("Technical details"):
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("RSI", f"{result['rsi']:.1f}")
+        d2.metric("MACD", f"{result['macd']:.3f}")
+        d3.metric("20-day average", f"${result['ma20']:.2f}")
+        d4.metric("50-day average", f"${result['ma50']:.2f}")
+
+    with st.expander("Price chart"):
+        chart = go.Figure()
+        history = result["history"]
+        chart.add_trace(go.Scatter(x=history.index, y=history["Close"], mode="lines", name="Close"))
+        chart.add_trace(go.Scatter(x=history.index, y=history["MA20"], mode="lines", name="MA20"))
+        chart.add_trace(go.Scatter(x=history.index, y=history["MA50"], mode="lines", name="MA50"))
+        chart.update_layout(height=430, margin=dict(l=10, r=10, t=20, b=10), legend_orientation="h")
+        st.plotly_chart(chart, use_container_width=True)
+
+    st.button("Research this ticker", use_container_width=True, on_click=open_research_for, args=(ticker,))
+
+def render_active_trades():
+    st.header("Active Trades")
+    st.caption(
+        "Active positions, pending paper entries, current P/L, stops, targets, "
+        "and trade history."
+    )
+
+    if not logged_in:
+        st.info("Sign in from the sidebar to view and sync trades.")
+        return
+
+    refresh_col, active_count_col, pending_count_col = st.columns(3)
+    if refresh_col.button("Refresh & check orders", use_container_width=True):
+        get_latest_quote.clear()
+        get_latest_trade_price.clear()
+        check_pending_limit_fill.clear()
+        st.rerun()
+
+    try:
+        pending_orders = load_pending_orders(
+            supabase,
+            st.session_state.supabase_user_id,
+        )
+        filled_symbols, pending_checks = sync_pending_orders(
+            supabase,
+            pending_orders,
+        )
+        if filled_symbols:
+            st.success(
+                "Filled pending paper order(s): "
+                + ", ".join(sorted(set(filled_symbols)))
+            )
+            pending_orders = load_pending_orders(
+                supabase,
+                st.session_state.supabase_user_id,
+            )
+    except Exception as error:
+        pending_orders = []
+        pending_checks = {}
+        st.error(f"Pending orders could not be checked: {error}")
+
+    try:
+        active_trades = load_cloud_trades(
+            supabase,
+            st.session_state.supabase_user_id,
+        )
+    except Exception as error:
+        active_trades = []
+        st.error(f"Cloud trades could not be loaded: {error}")
+
+    active_count_col.metric("Active trades", len(active_trades))
+    pending_count_col.metric("Pending orders", len(pending_orders))
+
+    if pending_orders:
+        st.subheader("Pending Paper Orders")
+        st.caption(
+            "These are limit entries waiting for the recommended price. They are "
+            "checked whenever this page loads or Refresh & check orders is pressed."
         )
 
-        settings_column_1, settings_column_2, settings_column_3 = (
-            st.columns(3)
-        )
+        for order in pending_orders:
+            entry = float(order["entry_price"])
+            stop = float(order["stop_price"])
+            target = float(order["target_price"])
+            quantity = int(order.get("quantity") or 1)
+            check = pending_checks.get(order["id"], {})
+            current = check.get("current_price")
 
-        settings_column_1.metric(
-            "Test period",
-            backtest_lookback_label,
-        )
-
-        settings_column_2.metric(
-            "Minimum quality",
-            f"{backtest_minimum_quality} / 100",
-        )
-
-        settings_column_3.metric(
-            "Round-trip cost assumption",
-            f"{2 * backtest_cost_bps:.0f} basis points",
-        )
-
-        if backtest_statistics is None:
-            if "backtest_error" in locals():
-                st.error(
-                    "The historical test could not be completed: "
-                    + backtest_error
+            with st.container(border=True):
+                title_col, side_col = st.columns([3, 1])
+                title_col.markdown(f"### {order['ticker']} · Pending")
+                side_col.markdown(
+                    f"**{order['direction']} · {quantity} paper share(s)**"
                 )
+
+                if current is None:
+                    st.warning("Current price could not be loaded.")
+                else:
+                    if order["direction"] == "LONG":
+                        distance = float(current) - entry
+                        waiting_text = (
+                            f"Waiting for a pullback of ${max(0.0, distance):.2f}"
+                            if distance > 0
+                            else "Entry condition is at or through the limit"
+                        )
+                    else:
+                        distance = entry - float(current)
+                        waiting_text = (
+                            f"Waiting for a rise of ${max(0.0, distance):.2f}"
+                            if distance > 0
+                            else "Entry condition is at or through the limit"
+                        )
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Current", f"${float(current):.2f}")
+                    m2.metric("Limit entry", f"${entry:.2f}")
+                    m3.metric("Status", "WAITING")
+                    st.write(waiting_text)
+
+                st.write(
+                    f"**Stop:** ${stop:.2f}  •  **Target:** ${target:.2f}"
+                )
+                if st.button(
+                    "Cancel pending order",
+                    key=f"cancel_pending_{order['id']}",
+                    use_container_width=True,
+                ):
+                    try:
+                        cancel_pending_order(supabase, order["id"])
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Pending order could not be cancelled: {error}")
+
+    if not active_trades:
+        st.info("No active trades yet.")
+    else:
+        st.subheader("Active Positions")
+        for trade in active_trades:
+            entry = float(trade["entry_price"])
+            stop = float(trade["stop_price"])
+            target = float(trade["target_price"])
+            quantity = int(trade.get("quantity") or 1)
+            try:
+                current = get_latest_trade_price(trade["ticker"])
+            except Exception:
+                current = None
+
+            with st.container(border=True):
+                title_col, side_col = st.columns([3, 1])
+                paper_label = " · PAPER" if "PAPER" in str(trade.get("notes") or "").upper() else ""
+                title_col.markdown(f"### {trade['ticker']}{paper_label}")
+                side_col.markdown(f"**{trade['direction']} · {quantity} share(s)**")
+
+                if current is None:
+                    st.warning("Current price could not be loaded.")
+                    default_exit = entry
+                else:
+                    metrics = calculate_live_trade_metrics(trade, current)
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Current", f"${current:.2f}")
+                    m2.metric("Unrealized P/L", f"${metrics['total_pnl']:+.2f}", f"{metrics['pnl_percent']:+.2%}")
+                    m3.metric("Status", metrics["status"])
+                    st.write(f"**Entry:** ${entry:.2f}  •  **Stop:** ${stop:.2f}  •  **Target:** ${target:.2f}")
+                    st.caption(f"${metrics['stop_distance']:.2f} from stop · ${metrics['target_distance']:.2f} from target")
+                    default_exit = current
+
+                with st.expander("Close this trade"):
+                    with st.form(f"clean_close_trade_{trade['id']}"):
+                        exit_price = st.number_input("Exit price", min_value=0.01, value=float(default_exit), step=0.01, format="%.2f")
+                        notes = st.text_area("Notes (optional)")
+                        close_clicked = st.form_submit_button("Close and record trade", use_container_width=True)
+                    if close_clicked:
+                        try:
+                            close_cloud_trade(supabase, trade["id"], float(exit_price), notes.strip())
+                            st.rerun()
+                        except Exception as error:
+                            st.error(f"Trade close failed: {error}")
+
+    with st.expander("Record an already-filled trade"):
+        st.caption(
+            "Use this only for a position that has already filled in your broker or paper account. "
+            "Unfilled scanner recommendations belong under Pending Paper Orders."
+        )
+        with st.form("clean_add_trade", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                ticker = st.text_input("Ticker").strip().upper()
+                direction = st.selectbox("Direction", ["LONG", "SHORT"])
+                quantity = st.number_input("Shares", min_value=1, value=1, step=1)
+                paper_trade = st.checkbox("Paper trade", value=True, key="manual_paper_trade")
+            with c2:
+                entry = st.number_input("Filled entry price", min_value=0.0, step=0.01, format="%.2f")
+                stop = st.number_input("Stop loss", min_value=0.0, step=0.01, format="%.2f")
+                target = st.number_input("Target price", min_value=0.0, step=0.01, format="%.2f")
+            already_filled = st.checkbox(
+                "I confirm this trade has already filled at the entry price"
+            )
+            clicked = st.form_submit_button("Record filled trade", use_container_width=True)
+
+        if clicked:
+            valid = ticker and entry > 0 and stop > 0 and target > 0
+            valid = valid and (stop < entry < target if direction == "LONG" else target < entry < stop)
+            if not valid:
+                st.error("Check the ticker and make sure the stop and target are on the correct sides of entry.")
+            elif not already_filled:
+                st.error("Confirm that the trade has already filled before recording it as Active.")
             else:
-                st.info(
-                    "No completed historical trades met the "
-                    "selected rules."
-                )
+                try:
+                    add_cloud_trade(
+                        supabase,
+                        st.session_state.supabase_user_id,
+                        {
+                            "ticker": ticker,
+                            "direction": direction,
+                            "quantity": int(quantity),
+                            "entry": float(entry),
+                            "stop": float(stop),
+                            "target": float(target),
+                            "notes": "PAPER TRADE | Manually confirmed filled" if paper_trade else "Manually confirmed filled",
+                        },
+                    )
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Trade could not be saved: {error}")
 
+    try:
+        closed = load_closed_trades(supabase, st.session_state.supabase_user_id, limit=50)
+    except Exception as error:
+        closed = []
+        st.error(f"Trade history could not be loaded: {error}")
+
+    with st.expander(f"Trade History ({len(closed)})"):
+        rows = []
+        for trade in closed:
+            if trade.get("exit_price") is None:
+                continue
+            rows.append(
+                {
+                    "Ticker": trade["ticker"],
+                    "Side": trade["direction"],
+                    "Shares": int(trade.get("quantity") or 1),
+                    "Entry": f"${float(trade['entry_price']):.2f}",
+                    "Exit": f"${float(trade['exit_price']):.2f}",
+                    "P/L": f"${calculate_closed_trade_result(trade):+.2f}",
+                }
+            )
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         else:
-            metric_1, metric_2, metric_3, metric_4, metric_5 = (
-                st.columns(5)
+            st.info("No closed trades yet.")
+
+
+def run_clean_research(
+    ticker,
+    years,
+    holding_days,
+    minimum_quality,
+    minimum_macro_score,
+    profile_selection,
+):
+    symbol = ticker.strip().upper()
+    start_timestamp = pd.Timestamp.now(tz="America/New_York") - pd.DateOffset(years=years)
+    download_start = start_timestamp - pd.DateOffset(days=220)
+
+    stock_history = yf.Ticker(symbol).history(
+        start=download_start.date().isoformat(),
+        auto_adjust=True,
+    )
+    classification = resolve_ticker_macro_profile(symbol, profile_selection)
+
+    initial_plan = build_ticker_factor_plan(classification, oil_threshold=0.02)
+    requested_labels = tuple(sorted({factor["key"] for factor in initial_plan}))
+    macro_history = load_macro_history(
+        download_start.date().isoformat(),
+        requested_labels,
+    )
+    macro_context = build_macro_context(macro_history, lookback_days=5)
+
+    oil_moves = (
+        macro_context["Oil Return"].dropna().abs()
+        if "Oil Return" in macro_context
+        else pd.Series(dtype=float)
+    )
+    if oil_moves.empty:
+        oil_threshold = 0.02
+    else:
+        oil_threshold = float(oil_moves.quantile(0.75))
+        oil_threshold = max(0.01, min(0.05, oil_threshold))
+
+    factor_plan = build_ticker_factor_plan(classification, oil_threshold=oil_threshold)
+    factor_table, current_macro_score = build_current_factor_table(macro_context, factor_plan)
+
+    technical_trades, prepared = run_strategy_backtest(
+        stock_history,
+        start_timestamp.date(),
+        holding_days,
+        minimum_quality,
+        7.5,
+        stop_atr_multiple=1.25,
+        reward_to_risk=2.0,
+    )
+    technical_stats = calculate_backtest_statistics(technical_trades, prepared)
+
+    macro_trades, macro_prepared = run_macro_strategy_backtest(
+        data=stock_history,
+        macro_context=macro_context,
+        test_start_date=start_timestamp.date(),
+        holding_days=holding_days,
+        minimum_quality=minimum_quality,
+        cost_bps_per_side=7.5,
+        factor_plan=factor_plan,
+        minimum_macro_score=minimum_macro_score,
+        stop_atr_multiple=1.25,
+        reward_to_risk=2.0,
+    )
+    macro_stats = calculate_backtest_statistics(macro_trades, macro_prepared)
+
+    oil_is_relevant = any(
+        factor["key"] == "Oil" and factor["weight"] > 0
+        for factor in factor_plan
+    )
+    oil_trades = pd.DataFrame()
+    oil_stats = None
+    baseline_stats = None
+
+    if oil_is_relevant and "Oil Return" in macro_context:
+        study_mode = (
+            "Long stock after oil drop"
+            if classification["profile"] == "Airline"
+            else "Long stock after oil spike"
+        )
+        oil_trades, oil_prepared = run_oil_shock_study(
+            data=stock_history,
+            macro_context=macro_context,
+            test_start_date=start_timestamp.date(),
+            holding_days=holding_days,
+            cost_bps_per_side=5.0,
+            oil_threshold=oil_threshold,
+            study_mode=study_mode,
+        )
+        oil_stats = calculate_backtest_statistics(oil_trades, oil_prepared)
+        baseline_trades, baseline_prepared = run_unconditional_long_study(
+            stock_history,
+            start_timestamp.date(),
+            holding_days,
+            5.0,
+        )
+        baseline_stats = calculate_backtest_statistics(baseline_trades, baseline_prepared)
+
+    return {
+        "ticker": symbol,
+        "years": years,
+        "holding_days": holding_days,
+        "classification": classification,
+        "factor_plan": factor_plan,
+        "factor_table": factor_table,
+        "current_macro_score": current_macro_score,
+        "oil_threshold": oil_threshold,
+        "macro_context": macro_context,
+        "technical_trades": technical_trades,
+        "technical_stats": technical_stats,
+        "macro_trades": macro_trades,
+        "macro_stats": macro_stats,
+        "oil_trades": oil_trades,
+        "oil_stats": oil_stats,
+        "baseline_stats": baseline_stats,
+    }
+
+
+def render_research():
+    st.header("Research Lab")
+    st.caption(
+        "Compare a technical strategy with a ticker-aware macro model. The app "
+        "emphasizes factors that make economic sense for the company and marks "
+        "unrelated factors as observed but not used."
+    )
+
+    if "research_ticker_input" not in st.session_state:
+        st.session_state.research_ticker_input = "AAL"
+
+    with st.form("clean_research_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            ticker = st.text_input(
+                "Ticker",
+                key="research_ticker_input",
+            ).strip().upper()
+            years = st.selectbox("History", [2, 5, 10], index=1)
+        with c2:
+            holding_days = st.selectbox("Holding period", [1, 2, 3, 5, 10], index=2)
+            minimum_quality = st.slider("Minimum setup quality", 40, 90, 55, 5)
+
+        with st.expander("Advanced research controls"):
+            minimum_macro_score = st.slider(
+                "Minimum macro confirmation score",
+                1, 6, 2,
+                help="Higher values require more relevant macro factors to agree.",
+            )
+            profile = st.selectbox(
+                "Relationship profile",
+                [
+                    "Auto by ticker", "Airline", "Semiconductor", "Bank",
+                    "Energy", "Gold miner", "Industrial", "Growth / technology",
+                    "General market",
+                ],
             )
 
-            metric_1.metric(
-                "Completed trades",
-                f"{backtest_statistics['total_trades']}",
-            )
+        run_clicked = st.form_submit_button(
+            "Run Research",
+            type="primary",
+            use_container_width=True,
+        )
 
-            metric_2.metric(
-                "Historical win rate",
-                f"{backtest_statistics['win_rate']:.1%}",
-            )
-
-            metric_3.metric(
-                "Average trade",
-                f"{backtest_statistics['average_return']:+.2%}",
-            )
-
-            metric_4.metric(
-                "Compounded return",
-                f"{backtest_statistics['total_return']:+.1%}",
-            )
-
-            metric_5.metric(
-                "Maximum drawdown",
-                f"{backtest_statistics['max_drawdown']:.1%}",
-            )
-
-            comparison_1, comparison_2, comparison_3 = (
-                st.columns(3)
-            )
-
-            if math.isinf(
-                backtest_statistics["profit_factor"]
-            ):
-                profit_factor_text = "No losing trades"
-            else:
-                profit_factor_text = (
-                    f"{backtest_statistics['profit_factor']:.2f}"
+    if run_clicked:
+        try:
+            with st.spinner("Detecting the company profile and running ticker-aware tests…"):
+                st.session_state.research_result = run_clean_research(
+                    ticker=ticker,
+                    years=years,
+                    holding_days=holding_days,
+                    minimum_quality=minimum_quality,
+                    minimum_macro_score=minimum_macro_score,
+                    profile_selection=profile,
                 )
+        except Exception as error:
+            st.session_state.research_result = None
+            st.error(f"Research could not be completed: {error}")
 
-            comparison_1.metric(
-                "Profit factor",
-                profit_factor_text,
+    result = st.session_state.research_result
+    if not result:
+        st.info("Run Research to compare the technical strategy with relevant macro confirmation.")
+        return
+
+    technical = result["technical_stats"]
+    macro = result["macro_stats"]
+    technical_count = technical["total_trades"] if technical else 0
+    macro_count = macro["total_trades"] if macro else 0
+
+    if macro and technical:
+        macro_average_edge = macro["average_return"] - technical["average_return"]
+        macro_win_edge = macro["win_rate"] - technical["win_rate"]
+        if macro_average_edge >= 0.002 and macro_win_edge >= 0.03:
+            macro_verdict = "Ticker-aware macro confirmation helped"
+            macro_kind = "success"
+        elif macro_average_edge <= -0.002 and macro_win_edge <= -0.03:
+            macro_verdict = "Ticker-aware macro confirmation hurt"
+            macro_kind = "error"
+        else:
+            macro_verdict = "No clear macro improvement"
+            macro_kind = "info"
+    else:
+        macro_average_edge = None
+        macro_verdict = "Not enough data"
+        macro_kind = "warning"
+
+    macro_confidence = "Low" if macro_count < 10 else "Moderate" if macro_count < 30 else "Higher"
+    classification = result["classification"]
+    factor_table = result["factor_table"]
+
+    st.subheader(f"Ticker-aware macro verdict for {result['ticker']}")
+    st.caption(
+        f"Detected profile: **{classification['profile']}** • "
+        f"Sector: {classification.get('sector', 'Unknown')} • "
+        f"Industry: {classification.get('industry', 'Unknown')}"
+    )
+
+    with st.container(border=True):
+        verdict_icon = {"success": "✅", "error": "⚠️", "warning": "⚠️", "info": "ℹ️"}.get(macro_kind, "ℹ️")
+        st.markdown(f"### {verdict_icon} {macro_verdict}")
+        st.write(
+            f"Confidence: {macro_confidence}. Technical-only sample: {technical_count} trades. "
+            f"Macro-confirmed sample: {macro_count} trades."
+        )
+
+        relevant = factor_table[factor_table["Weight"] != "Ignored"] if not factor_table.empty else factor_table
+        supportive = relevant[relevant["Current effect"] == "Supportive"]["Factor"].tolist()
+        negative = relevant[relevant["Current effect"] == "Negative"]["Factor"].tolist()
+        if supportive:
+            st.write("**Current support:** " + ", ".join(supportive[:3]))
+        if negative:
+            st.write("**Current risks:** " + ", ".join(negative[:3]))
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Macro-confirmed trades", macro_count)
+        m2.metric("Macro win rate", f"{macro['win_rate']:.1%}" if macro else "—")
+        m3.metric(
+            "Average-return difference",
+            f"{macro_average_edge:+.2%}" if macro_average_edge is not None else "—",
+        )
+
+        if macro_kind == "info":
+            st.caption(
+                "The relevant macro filter did not clearly improve both win rate and average return. "
+                "That means the historical evidence is inconclusive, not automatically bearish."
             )
 
-            comparison_2.metric(
-                "Median trade",
-                f"{backtest_statistics['median_return']:+.2%}",
+    st.markdown("### Factors used for this ticker")
+    if factor_table.empty:
+        st.info("Macro factor data was unavailable.")
+    else:
+        main_table = factor_table[factor_table["Weight"] != "Ignored"]
+        st.dataframe(
+            main_table[["Factor", "Relevance", "Current effect", "Reading", "Weight"]],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with st.expander("Full macro context, including ignored factors"):
+        if factor_table.empty:
+            st.info("Macro factor data was unavailable.")
+        else:
+            st.dataframe(factor_table, hide_index=True, use_container_width=True)
+            st.caption(
+                "Ignored factors remain visible for context, but they do not affect the headline score. "
+                "For example, oil is observed for NVDA but receives no weight."
             )
 
-            comparison_3.metric(
-                f"{ticker} buy-and-hold return",
-                f"{backtest_statistics['buy_hold_return']:+.1%}",
+    with st.expander("Strategy comparison"):
+        rows = [
+            build_strategy_comparison_row("Technical only", technical),
+            build_strategy_comparison_row("Technical + ticker-aware macro", macro),
+        ]
+        if result["oil_stats"] is not None:
+            rows.append(build_strategy_comparison_row("Oil relationship study", result["oil_stats"]))
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption(
+            "Backtests enter at the next session open, use ATR-based stops and 2:1 targets, "
+            "assume the stop was hit first when one daily candle touches both levels, include "
+            "7.5 basis points per side, and reserve the final 30% of trades as an out-of-sample check. "
+            "Buy-and-hold is always invested, while strategy exposure is shown separately."
+        )
+
+    if result["oil_stats"] is not None:
+        oil_stats = result["oil_stats"]
+        baseline_stats = result["baseline_stats"]
+        with st.expander("Ticker-specific oil relationship"):
+            oil_edge = (
+                oil_stats["average_return"] - baseline_stats["average_return"]
+                if oil_stats and baseline_stats else None
+            )
+            st.write(
+                f"Oil is highly relevant to the detected **{classification['profile']}** profile, "
+                "so it receives a dedicated historical study."
+            )
+            o1, o2, o3 = st.columns(3)
+            o1.metric("Matching trades", oil_stats["total_trades"] if oil_stats else 0)
+            o2.metric("Win rate", f"{oil_stats['win_rate']:.1%}" if oil_stats else "—")
+            o3.metric("Average-return edge", f"{oil_edge:+.2%}" if oil_edge is not None else "—")
+            st.caption(
+                f"Automatic meaningful-oil threshold: {result['oil_threshold']:.1%} over five trading days."
             )
 
-            st.subheader(
-                "Strategy equity versus buy and hold"
-            )
-
-            equity_figure = go.Figure()
-
-            equity_curve = (
-                backtest_statistics["equity_curve"]
-            )
-
-            for column in equity_curve.columns:
-                equity_figure.add_trace(
+    with st.expander("Equity curves"):
+        for label, stats in [
+            ("Technical only", technical),
+            ("Technical + ticker-aware macro", macro),
+            ("Oil relationship study", result["oil_stats"]),
+        ]:
+            if stats is None:
+                continue
+            st.markdown(f"**{label}**")
+            chart = go.Figure()
+            for column in stats["equity_curve"].columns:
+                chart.add_trace(
                     go.Scatter(
-                        x=equity_curve.index,
-                        y=equity_curve[column],
+                        x=stats["equity_curve"].index,
+                        y=stats["equity_curve"][column],
                         mode="lines",
                         name=column,
                     )
                 )
+            chart.update_layout(height=360, margin=dict(l=10, r=10, t=20, b=10))
+            st.plotly_chart(chart, use_container_width=True)
 
-            equity_figure.update_layout(
-                height=500,
-                yaxis_title=(
-                    "Hypothetical value of $10,000"
-                ),
-                margin=dict(
-                    l=10,
-                    r=10,
-                    t=30,
-                    b=10,
-                ),
-            )
-
-            st.plotly_chart(
-                equity_figure,
-                use_container_width=True,
-            )
-
-            st.subheader(
-                "Long and short results"
-            )
-
-            direction_breakdown = (
-                build_direction_breakdown(
-                    backtest_trades
-                )
-            )
-
-            if not direction_breakdown.empty:
-                display_breakdown = (
-                    direction_breakdown.copy()
-                )
-
-                display_breakdown["Win rate"] = (
-                    display_breakdown["Win rate"]
-                    .map(
-                        lambda value: (
-                            f"{value:.1%}"
-                        )
-                    )
-                )
-
-                display_breakdown["Average return"] = (
-                    display_breakdown[
-                        "Average return"
-                    ]
-                    .map(
-                        lambda value: (
-                            f"{value:+.2%}"
-                        )
-                    )
-                )
-
-                display_breakdown[
-                    "Total compounded return"
-                ] = (
-                    display_breakdown[
-                        "Total compounded return"
-                    ]
-                    .map(
-                        lambda value: (
-                            f"{value:+.1%}"
-                        )
-                    )
-                )
-
-                st.dataframe(
-                    display_breakdown,
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-            current_direction = None
-
-            if trade_setup["bias"] == "LONG BIAS":
-                current_direction = "LONG"
-
-            elif trade_setup["bias"] == "SHORT BIAS":
-                current_direction = "SHORT"
-
-            st.subheader(
-                "Historical context for today's reading"
-            )
-
-            if current_direction is None:
-                st.info(
-                    "Today's dashboard reading is WAIT, "
-                    "so there is no matching long or short "
-                    "signal to compare."
-                )
-
-            else:
-                similar_trades = backtest_trades[
-                    backtest_trades["Direction"]
-                    == current_direction
-                ]
-
-                if similar_trades.empty:
-                    st.info(
-                        "No historical trades matched today's "
-                        f"{current_direction.lower()} direction "
-                        "under these settings."
-                    )
-
-                else:
-                    context_1, context_2, context_3 = (
-                        st.columns(3)
-                    )
-
-                    context_1.metric(
-                        "Matching past trades",
-                        f"{len(similar_trades)}",
-                    )
-
-                    context_2.metric(
-                        "Past win rate",
-                        (
-                            f"{similar_trades['Winner'].mean():.1%}"
-                        ),
-                    )
-
-                    context_3.metric(
-                        "Average past return",
-                        (
-                            f"{similar_trades['Net Return'].mean():+.2%}"
-                        ),
-                    )
-
-                    if len(similar_trades) < 10:
-                        st.warning(
-                            "This matching sample is small, so "
-                            "its win rate is especially uncertain."
-                        )
-
-            st.subheader(
-                "Most recent historical trades"
-            )
-
-            recent_trades = (
-                backtest_trades
-                .tail(20)
-                .sort_values(
-                    "Signal Date",
-                    ascending=False,
-                )
-            )
-
+    with st.expander("Recent macro-confirmed trades"):
+        if result["macro_trades"].empty:
+            st.info("No historical trades met both the technical and ticker-aware macro filters.")
+        else:
+            display = result["macro_trades"].tail(25).sort_values("Signal Date", ascending=False).copy()
+            for column in ["Signal Date", "Entry Date", "Exit Date"]:
+                display[column] = pd.to_datetime(display[column]).dt.strftime("%Y-%m-%d")
+            display["Net Return"] = display["Net Return"].map(lambda value: f"{value:+.2%}")
             st.dataframe(
-                format_backtest_trade_table(
-                    recent_trades
-                ),
+                display[["Signal Date", "Direction", "Setup Quality", "Macro Score", "Macro Evidence", "Net Return"]],
                 hide_index=True,
                 use_container_width=True,
             )
 
-            st.warning(
-                "Historical win rate is not a probability that "
-                "the next trade will win. Results can change "
-                "substantially with the ticker, holding period, "
-                "quality threshold, costs, and market regime. "
-                "Short results do not include stock-borrow fees."
-            )
-
-    with summary_tab:
-        st.subheader(f"{ticker} snapshot")
-
-        column_1, column_2, column_3 = st.columns(3)
-
-        column_1.metric(
-            "Latest closing price",
-            f"${price:.2f}",
-        )
-
-        column_2.metric(
-            "Daily change",
-            f"${change:+.2f}",
-            f"{change_percent:+.2f}%",
-        )
-
-        column_3.metric(
-            "Trading volume",
-            f"{int(latest['Volume']):,}",
-        )
-
-        column_4, column_5 = st.columns(2)
-
-        column_4.metric(
-            f"{selected_period.title()} high",
-            f"${history['High'].max():.2f}",
-        )
-
-        column_5.metric(
-            f"{selected_period.title()} low",
-            f"${history['Low'].min():.2f}",
-        )
-
-        st.subheader("Technical trend")
-
-        trend_box(f"{trend}: {trend_text}")
-
-        column_6, column_7 = st.columns(2)
-
-        column_6.metric(
-            "20-day average",
-            f"${ma20:.2f}",
-        )
-
-        column_7.metric(
-            "50-day average",
-            f"${ma50:.2f}",
-        )
-
-        st.subheader("RSI momentum")
-
-        st.metric(
-            "14-day RSI",
-            f"{rsi:.1f}",
-        )
-
-        st.info(rsi_text)
-
-        st.subheader("MACD momentum")
-
-        column_8, column_9, column_10 = st.columns(3)
-
-        column_8.metric(
-            "MACD",
-            f"{macd:.3f}",
-        )
-
-        column_9.metric(
-            "Signal line",
-            f"{signal:.3f}",
-        )
-
-        column_10.metric(
-            "Histogram",
-            f"{histogram:+.3f}",
-        )
-
-        macd_box(f"{macd_status}: {macd_text}")
-
-        st.subheader("Bollinger Bands")
-
-        column_11, column_12, column_13 = st.columns(3)
-
-        column_11.metric(
-            "Upper band",
-            f"${upper_band:.2f}",
-        )
-
-        column_12.metric(
-            "Middle band",
-            f"${ma20:.2f}",
-        )
-
-        column_13.metric(
-            "Lower band",
-            f"${lower_band:.2f}",
-        )
-
-        st.info(f"Current position: {band_status}.")
-
-        st.subheader("Dashboard summary")
-
-        st.write(
-            f"**{ticker}** shows a "
-            f"**{trend.lower()}**, "
-            f"**{rsi_status.lower()} RSI**, "
-            f"**{macd_status.lower()}**, and is "
-            f"**{band_status.lower()}**."
-        )
-
-        st.write(
-            f"Current dashboard reading: "
-            f"**{trade_setup['bias']}** with a "
-            f"**{trade_setup['setup_quality']} / 100** "
-            f"setup-quality score."
-        )
-
-    with price_tab:
-        st.subheader(
-            f"{ticker} — {selected_period.title()} Price Chart"
-        )
-
-        price_chart = make_subplots(
-            rows=2,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.04,
-            row_heights=[0.72, 0.28],
-        )
-
-        price_chart.add_trace(
-            go.Candlestick(
-                x=history.index,
-                open=history["Open"],
-                high=history["High"],
-                low=history["Low"],
-                close=history["Close"],
-                name="Price",
-            ),
-            row=1,
-            col=1,
-        )
-
-        selected_overlays = st.multiselect(
-            "Chart overlays",
-            [
-                "20-day average",
-                "50-day average",
-                "Bollinger Bands",
-            ],
-            default=[
-                "20-day average",
-                "50-day average",
-            ],
-            help=(
-                "Turn overlays on or off to keep the chart easier "
-                "to read."
-            ),
-        )
-
-        chart_lines = []
-
-        if "20-day average" in selected_overlays:
-            chart_lines.append(
-                ("MA20", "20-Day Average")
-            )
-
-        if "50-day average" in selected_overlays:
-            chart_lines.append(
-                ("MA50", "50-Day Average")
-            )
-
-        if "Bollinger Bands" in selected_overlays:
-            chart_lines.extend(
-                [
-                    ("Upper Band", "Upper Bollinger Band"),
-                    ("Lower Band", "Lower Bollinger Band"),
-                ]
-            )
-
-        for column, name in chart_lines:
-            price_chart.add_trace(
-                go.Scatter(
-                    x=history.index,
-                    y=history[column],
-                    mode="lines",
-                    name=name,
-                ),
-                row=1,
-                col=1,
-            )
-
-        price_chart.add_trace(
-            go.Bar(
-                x=history.index,
-                y=history["Volume"],
-                name="Volume",
-            ),
-            row=2,
-            col=1,
-        )
-
-        price_chart.update_layout(
-            height=720,
-            xaxis_rangeslider_visible=False,
-            margin=dict(
-                l=10,
-                r=10,
-                t=30,
-                b=10,
-            ),
-        )
-
-        price_chart.update_yaxes(
-            title_text="Price",
-            row=1,
-            col=1,
-        )
-
-        price_chart.update_yaxes(
-            title_text="Volume",
-            row=2,
-            col=1,
-        )
-
-        st.plotly_chart(
-            price_chart,
-            use_container_width=True,
-        )
-
-    with momentum_tab:
-        st.subheader("RSI Chart")
-
-        rsi_chart = go.Figure()
-
-        rsi_chart.add_trace(
-            go.Scatter(
-                x=history.index,
-                y=history["RSI"],
-                mode="lines",
-                name="RSI",
-            )
-        )
-
-        rsi_chart.add_hline(
-            y=70,
-            line_dash="dash",
-        )
-
-        rsi_chart.add_hline(
-            y=30,
-            line_dash="dash",
-        )
-
-        rsi_chart.update_yaxes(
-            range=[0, 100],
-            title_text="RSI",
-        )
-
-        rsi_chart.update_layout(
-            height=400,
-            margin=dict(
-                l=10,
-                r=10,
-                t=30,
-                b=10,
-            ),
-        )
-
-        st.plotly_chart(
-            rsi_chart,
-            use_container_width=True,
-        )
-
-        st.subheader("MACD Chart")
-
-        macd_chart = go.Figure()
-
-        macd_chart.add_trace(
-            go.Scatter(
-                x=history.index,
-                y=history["MACD"],
-                mode="lines",
-                name="MACD",
-            )
-        )
-
-        macd_chart.add_trace(
-            go.Scatter(
-                x=history.index,
-                y=history["Signal"],
-                mode="lines",
-                name="Signal Line",
-            )
-        )
-
-        macd_chart.add_trace(
-            go.Bar(
-                x=history.index,
-                y=history["Histogram"],
-                name="Histogram",
-            )
-        )
-
-        macd_chart.update_layout(
-            height=450,
-            margin=dict(
-                l=10,
-                r=10,
-                t=30,
-                b=10,
-            ),
-        )
-
-        st.plotly_chart(
-            macd_chart,
-            use_container_width=True,
-        )
-
-    with watchlist_tab:
-        st.subheader("Watchlist snapshot")
-
-        watchlist_symbols = parse_watchlist(
-            watchlist_text,
-            ticker,
-        )
-
-        st.caption(
-            "The analyzed ticker is automatically included. "
-            "Up to eight symbols are shown."
-        )
-
-        try:
-            with st.spinner("Loading watchlist data..."):
-                (
-                    watchlist_table,
-                    normalized_prices,
-                    failed_symbols,
-                ) = build_watchlist_data(watchlist_symbols)
-
-        except Exception as error:
-            watchlist_table = pd.DataFrame()
-            normalized_prices = pd.DataFrame()
-            failed_symbols = watchlist_symbols
-
-            st.warning(
-                f"Watchlist data could not be loaded: {error}"
-            )
-
-        if watchlist_table.empty:
-            st.info(
-                "No usable watchlist data was returned."
-            )
-
-        else:
-            st.dataframe(
-                watchlist_table,
-                hide_index=True,
-                use_container_width=True,
-            )
-
-        if failed_symbols:
-            st.warning(
-                "No usable data was returned for: "
-                + ", ".join(failed_symbols)
-            )
-
-        if not normalized_prices.empty:
-            st.subheader("Three-month performance comparison")
-
-            comparison_chart = go.Figure()
-
-            for symbol in normalized_prices.columns:
-                comparison_chart.add_trace(
-                    go.Scatter(
-                        x=normalized_prices.index,
-                        y=normalized_prices[symbol],
-                        mode="lines",
-                        name=symbol,
-                    )
-                )
-
-            comparison_chart.add_hline(
-                y=100,
-                line_dash="dash",
-            )
-
-            comparison_chart.update_layout(
-                height=520,
-                yaxis_title="Starting value = 100",
-                margin=dict(
-                    l=10,
-                    r=10,
-                    t=30,
-                    b=10,
-                ),
-            )
-
-            st.plotly_chart(
-                comparison_chart,
-                use_container_width=True,
-            )
-
-            st.info(
-                "Each line starts at 100, making percentage "
-                "performance easier to compare even when the "
-                "stocks have very different prices."
-            )
-
-    with news_tab:
-        st.subheader(f"Latest {ticker} news")
-
-        try:
-            news_items = stock.get_news(
-                count=10,
-                tab="news",
-            )
-        except Exception as error:
-            news_items = []
-            st.warning(
-                f"Company news could not be loaded: {error}"
-            )
-
-        parsed_news = [
-            parse_news_item(item)
-            for item in news_items
-        ]
-
-        parsed_news = [
-            article
-            for article in parsed_news
-            if article["title"]
-        ]
-
-        if not parsed_news:
-            st.info(
-                "No recent company news was returned for this ticker."
-            )
-
-        else:
-            for article in parsed_news:
-                if article["url"]:
-                    st.markdown(
-                        f"#### [{article['title']}]"
-                        f"({article['url']})"
-                    )
-                else:
-                    st.markdown(
-                        f"#### {article['title']}"
-                    )
-
-                details = article["publisher"]
-
-                if article["published"]:
-                    details += f" · {article['published']}"
-
-                st.caption(details)
-
-                if article["summary"]:
-                    st.write(article["summary"])
-
-                st.divider()
-
-        st.subheader("Trending market screens")
-        st.caption(
-            "These tables are based on Yahoo Finance's "
-            "predefined U.S. stock screeners."
-        )
-
-        movers_tab_1, movers_tab_2, movers_tab_3 = st.tabs(
-            [
-                "Most Active",
-                "Day Gainers",
-                "Day Losers",
-            ]
-        )
-
-        screener_settings = [
-            (
-                movers_tab_1,
-                "most_actives",
-                "Most-active screen unavailable",
-            ),
-            (
-                movers_tab_2,
-                "day_gainers",
-                "Day-gainers screen unavailable",
-            ),
-            (
-                movers_tab_3,
-                "day_losers",
-                "Day-losers screen unavailable",
-            ),
-        ]
-
-        for tab, screen_name, error_label in screener_settings:
-            with tab:
-                try:
-                    table = build_screener_table(
-                        screen_name,
-                        count=10,
-                    )
-
-                    if table.empty:
-                        st.info(
-                            "No stocks were returned by this screen."
-                        )
-                    else:
-                        st.dataframe(
-                            table,
-                            hide_index=True,
-                            use_container_width=True,
-                        )
-
-                except Exception as error:
-                    st.warning(f"{error_label}: {error}")
-
-    st.caption(
-        "These indicators and screens describe historical or "
-        "current market data. They are not predictions or "
-        "recommendations to buy or sell."
-    )
+    st.caption("Backtests describe historical relationships, not a guarantee that the next trade will work.")
+
+
+render_account_sidebar()
+
+st.radio(
+    "Main navigation",
+    ["Trade Finder", "Analyze", "Active Trades", "Research"],
+    key="nav_page",
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+st.divider()
+
+if st.session_state.nav_page == "Trade Finder":
+    render_trade_finder()
+elif st.session_state.nav_page == "Analyze":
+    render_analyze()
+elif st.session_state.nav_page == "Active Trades":
+    render_active_trades()
+else:
+    render_research()
+
+st.divider()
+st.caption("Yahoo Finance prices may be delayed. The app is a decision-support tool, not a guarantee or personalized financial advice.")
