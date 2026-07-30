@@ -41,8 +41,9 @@ if not auth_cookies.ready():
 st.title("📈 Folsom Trade Assistant")
 
 st.caption(
-    "A beginner-friendly decision dashboard for finding, "
-    "testing, validating, entering, and tracking higher-quality trades."
+    "A beginner-friendly dashboard for finding and explaining higher-quality "
+    "trade candidates with minimal input. Active Trades is an optional organizer "
+    "for positions you actually enter."
 )
 
 if "analysis_ready" not in st.session_state:
@@ -2014,7 +2015,9 @@ def build_strategy_comparison_row(label, statistics):
             "Average trade": "—",
             "Profit factor": "—",
             "Out-of-sample": "—",
+            "Stable periods": "—",
             "Compounded return": "—",
+            "Buy & hold": "—",
             "Exposure": "—",
             "Max drawdown": "—",
         }
@@ -2022,12 +2025,13 @@ def build_strategy_comparison_row(label, statistics):
     oos = statistics.get("out_of_sample") or {}
     pf = statistics["profit_factor"]
     pf_text = "∞" if math.isinf(pf) else f"{pf:.2f}"
-    oos_pf = oos.get("profit_factor")
     oos_text = (
         f"{int(oos.get('trades', 0))} trades • {float(oos.get('average_return', 0)):+.2%} avg"
         if oos
         else "—"
     )
+    stable_count = int(statistics.get("positive_stability_periods") or 0)
+    period_count = int(statistics.get("stability_period_count") or 0)
 
     return {
         "Strategy": label,
@@ -2037,10 +2041,13 @@ def build_strategy_comparison_row(label, statistics):
         "Average trade": f"{statistics['average_return']:+.2%}",
         "Profit factor": pf_text,
         "Out-of-sample": oos_text,
+        "Stable periods": f"{stable_count}/{period_count}" if period_count else "—",
         "Compounded return": f"{statistics['total_return']:+.1%}",
+        "Buy & hold": f"{statistics['buy_hold_return']:+.1%}",
         "Exposure": f"{statistics['exposure']:.0%}",
         "Max drawdown": f"{statistics['max_drawdown']:.1%}",
     }
+
 
 def simulate_atr_trade_exit(
     prepared,
@@ -2266,7 +2273,7 @@ def summarize_return_series(returns):
 
 
 def evaluate_backtest_edge(statistics):
-    """Grade evidence without pretending a small or overfit sample is reliable."""
+    """Grade evidence using sample size, costs, out-of-sample results, and stability."""
     if not statistics:
         return {
             "grade": "INSUFFICIENT",
@@ -2282,6 +2289,8 @@ def evaluate_backtest_edge(statistics):
     oos_trades = int(oos.get("trades") or 0)
     oos_average = float(oos.get("average_return") or 0.0)
     oos_pf = float(oos.get("profit_factor") or 0.0)
+    positive_periods = int(statistics.get("positive_stability_periods") or 0)
+    tested_periods = int(statistics.get("stability_period_count") or 0)
 
     if total < 15 or oos_trades < 5:
         return {
@@ -2299,6 +2308,14 @@ def evaluate_backtest_edge(statistics):
             "reason": "Expectancy or out-of-sample performance was negative after costs.",
         }
 
+    if tested_periods >= 3 and positive_periods < 2:
+        return {
+            "grade": "WEAK",
+            "label": "Unstable historical edge",
+            "score": -2,
+            "reason": f"Only {positive_periods} of {tested_periods} chronological periods were positive.",
+        }
+
     if (
         total >= 40
         and oos_trades >= 10
@@ -2307,12 +2324,13 @@ def evaluate_backtest_edge(statistics):
         and full_average >= 0.002
         and oos_average >= 0.001
         and statistics["max_drawdown"] > -0.25
+        and (tested_periods < 3 or positive_periods == tested_periods)
     ):
         return {
             "grade": "STRONG",
             "label": "Stronger historical edge",
             "score": 22,
-            "reason": "Positive expectancy held up in a larger out-of-sample sample.",
+            "reason": "Positive expectancy held up out of sample and across chronological periods.",
         }
 
     if (
@@ -2322,24 +2340,25 @@ def evaluate_backtest_edge(statistics):
         and oos_pf >= 1.0
         and full_average > 0
         and oos_average > 0
+        and (tested_periods < 3 or positive_periods >= 2)
     ):
         return {
             "grade": "MODERATE",
             "label": "Moderate historical edge",
             "score": 12,
-            "reason": "The strategy remained positive after the chronological split.",
+            "reason": "The strategy stayed positive after the chronological split and was reasonably stable.",
         }
 
     return {
         "grade": "WEAK",
         "label": "Weak historical edge",
         "score": 2,
-        "reason": "Results were positive but not strong or consistent enough for confirmation.",
+        "reason": "Results were positive but not strong, stable, or large enough for confirmation.",
     }
 
 
 def calculate_backtest_statistics(trades, prepared_history):
-    """Calculate performance, exposure, and chronological out-of-sample evidence."""
+    """Calculate performance, exposure, benchmark context, and stability checks."""
     if trades.empty:
         return None
 
@@ -2358,6 +2377,24 @@ def calculate_backtest_statistics(trades, prepared_history):
     in_sample_summary = summarize_return_series(in_sample_trades["Net Return"])
     out_of_sample_summary = summarize_return_series(out_of_sample_trades["Net Return"])
 
+    stability_periods = []
+    if len(ordered) >= 9:
+        boundaries = [0, len(ordered) // 3, (2 * len(ordered)) // 3, len(ordered)]
+        for period_number in range(3):
+            subset = ordered.iloc[boundaries[period_number]:boundaries[period_number + 1]]
+            summary = summarize_return_series(subset["Net Return"])
+            if summary:
+                stability_periods.append(
+                    {
+                        "period": period_number + 1,
+                        "trades": summary["trades"],
+                        "average_return": summary["average_return"],
+                        "profit_factor": summary["profit_factor"],
+                        "positive": summary["average_return"] > 0 and summary["profit_factor"] >= 1.0,
+                    }
+                )
+    positive_stability_periods = sum(1 for period in stability_periods if period["positive"])
+
     first_entry_date = pd.Timestamp(ordered["Entry Date"].iloc[0])
     last_exit_date = pd.Timestamp(ordered["Exit Date"].iloc[-1])
     benchmark_prices = prepared_history.loc[
@@ -2370,6 +2407,12 @@ def calculate_backtest_statistics(trades, prepared_history):
         if len(benchmark_prices) >= 2
         else 0.0
     )
+    if len(benchmark_prices) >= 2:
+        benchmark_growth = benchmark_prices.astype(float) / float(benchmark_prices.iloc[0])
+        benchmark_drawdown = (benchmark_growth / benchmark_growth.cummax()) - 1
+        buy_hold_max_drawdown = float(benchmark_drawdown.min())
+    else:
+        buy_hold_max_drawdown = 0.0
 
     if "Holding Sessions" in ordered:
         invested_sessions = int(ordered["Holding Sessions"].sum())
@@ -2404,6 +2447,7 @@ def calculate_backtest_statistics(trades, prepared_history):
         "average_win": full_summary["average_win"],
         "average_loss": full_summary["average_loss"],
         "buy_hold_return": float(buy_hold_return),
+        "buy_hold_max_drawdown": float(buy_hold_max_drawdown),
         "exposure": float(exposure),
         "in_sample": in_sample_summary,
         "out_of_sample": out_of_sample_summary,
@@ -2412,10 +2456,14 @@ def calculate_backtest_statistics(trades, prepared_history):
             if not out_of_sample_trades.empty
             else None
         ),
+        "stability_periods": stability_periods,
+        "stability_period_count": len(stability_periods),
+        "positive_stability_periods": positive_stability_periods,
         "equity_curve": equity_curve,
     }
     statistics["edge"] = evaluate_backtest_edge(statistics)
     return statistics
+
 
 def build_direction_breakdown(trades):
     """Summarize long and short trades separately."""
@@ -3198,6 +3246,82 @@ def get_current_ticker_macro_assessment(ticker, direction):
     }
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_earnings_context(ticker):
+    """Return the nearest known earnings event and a simple gap-risk label."""
+    symbol = ticker.strip().upper()
+    now = pd.Timestamp.now(tz="America/New_York")
+    candidates = []
+    timing = None
+
+    stock = yf.Ticker(symbol)
+
+    try:
+        calendar = stock.calendar
+        if isinstance(calendar, pd.DataFrame):
+            calendar = calendar.to_dict()
+        if isinstance(calendar, dict):
+            for key, value in calendar.items():
+                key_text = str(key).lower()
+                if "earning" not in key_text:
+                    continue
+                values = value if isinstance(value, (list, tuple, pd.Series)) else [value]
+                for item in values:
+                    parsed = pd.to_datetime(item, errors="coerce", utc=True)
+                    if pd.notna(parsed):
+                        candidates.append(parsed.tz_convert("America/New_York"))
+                if "time" in key_text and value:
+                    timing = str(value)
+    except Exception:
+        pass
+
+    try:
+        dates = stock.get_earnings_dates(limit=8)
+        if isinstance(dates, pd.DataFrame) and not dates.empty:
+            for item in dates.index:
+                parsed = pd.to_datetime(item, errors="coerce", utc=True)
+                if pd.notna(parsed):
+                    candidates.append(parsed.tz_convert("America/New_York"))
+    except Exception:
+        pass
+
+    future = sorted(
+        event for event in candidates
+        if event >= now - pd.Timedelta(days=1)
+    )
+    if not future:
+        return {
+            "date": None,
+            "days_away": None,
+            "risk": "Unknown",
+            "label": "Earnings date unavailable",
+            "timing": timing,
+        }
+
+    event = future[0]
+    days_away = int((event.date() - now.date()).days)
+    if days_away <= 1:
+        risk = "High"
+        label = "Earnings within 1 day"
+    elif days_away <= 5:
+        risk = "Elevated"
+        label = f"Earnings in {days_away} days"
+    elif days_away <= 14:
+        risk = "Upcoming"
+        label = f"Earnings in {days_away} days"
+    else:
+        risk = "Low"
+        label = f"Next earnings {event.strftime('%b %d')}"
+
+    return {
+        "date": event,
+        "days_away": days_away,
+        "risk": risk,
+        "label": label,
+        "timing": timing,
+    }
+
+
 def validate_finder_candidate(snapshot):
     """Turn a technical lean into a final verdict using history and macro context."""
     result = dict(snapshot)
@@ -3242,12 +3366,21 @@ def validate_finder_candidate(snapshot):
             "risks": [],
         }
 
+    try:
+        earnings = get_earnings_context(result["ticker"])
+    except Exception:
+        earnings = {"risk": "Unknown", "label": "Earnings date unavailable", "date": None, "days_away": None}
+
     rr = float((result.get("plan") or {}).get("reward_to_risk") or 0.0)
     final_score = int(setup["setup_quality"]) + int(edge["score"])
     final_score += 8 if macro["alignment"] == "Supportive" else -12 if macro["alignment"] == "Opposing" else 0
     final_score += 5 if rr >= 1.5 else -8
+    final_score += -18 if earnings["risk"] == "High" else -6 if earnings["risk"] == "Elevated" else 0
 
-    if edge["grade"] in {"STRONG", "MODERATE"} and setup["setup_quality"] >= 70 and macro["alignment"] != "Opposing" and rr >= 1.5:
+    if earnings["risk"] == "High":
+        final_verdict = "WATCH — EARNINGS RISK"
+        verdict_kind = "warning"
+    elif edge["grade"] in {"STRONG", "MODERATE"} and setup["setup_quality"] >= 70 and macro["alignment"] != "Opposing" and rr >= 1.5:
         final_verdict = f"{direction} CANDIDATE"
         verdict_kind = "success"
     elif edge["grade"] == "NEGATIVE":
@@ -3267,6 +3400,7 @@ def validate_finder_candidate(snapshot):
         f"Technical lean: {direction} with setup quality {setup['setup_quality']}/100.",
         f"Historical test: {edge['label']}. {edge['reason']}",
         f"Ticker-aware macro context: {macro['alignment']} ({macro['profile']} profile).",
+        f"Earnings risk: {earnings['label']}.",
         f"Planned reward-to-risk: {rr:.1f}:1." if rr else "No valid reward-to-risk plan was available.",
     ]
     if statistics:
@@ -3281,6 +3415,16 @@ def validate_finder_candidate(snapshot):
                 f"Out-of-sample: {int(oos['trades'])} trades with "
                 f"{float(oos['average_return']):+.2%} average return."
             )
+        stable = int(statistics.get("positive_stability_periods") or 0)
+        periods = int(statistics.get("stability_period_count") or 0)
+        if periods:
+            reasons.append(f"Stability check: {stable} of {periods} chronological periods were positive.")
+        strategy_return = float(statistics.get("total_return") or 0.0)
+        buy_hold_return = float(statistics.get("buy_hold_return") or 0.0)
+        reasons.append(
+            f"Benchmark context: strategy {strategy_return:+.1%} versus buy-and-hold {buy_hold_return:+.1%}, "
+            f"with {float(statistics.get('exposure') or 0):.0%} market exposure."
+        )
     if macro.get("support"):
         reasons.append("Macro support: " + ", ".join(macro["support"]) + ".")
     if macro.get("risks"):
@@ -3293,6 +3437,9 @@ def validate_finder_candidate(snapshot):
         "historical_grade": edge["grade"],
         "macro_alignment": macro["alignment"],
         "macro_profile": macro["profile"],
+        "earnings_risk": earnings["risk"],
+        "earnings_label": earnings["label"],
+        "earnings_date": earnings.get("date"),
         "final_score": final_score,
         "reasons": reasons,
         "statistics": statistics,
@@ -3301,56 +3448,385 @@ def validate_finder_candidate(snapshot):
 
 
 
+
+def candidate_liquidity_assessment(candidate, session_name):
+    """Grade current-session liquidity without pretending it is a live spread quote."""
+    volume = candidate.get("session_volume")
+    if volume is None:
+        try:
+            history = candidate.get("history")
+            if history is not None and not history.empty:
+                volume = float(history["Volume"].iloc[-1])
+        except Exception:
+            volume = None
+
+    if volume is None:
+        return {"label": "Unknown", "score": 0, "volume": None}
+
+    volume = float(volume)
+    if session_name in {"premarket", "afterhours"}:
+        if volume >= 1_000_000:
+            label, score = "Strong extended-hours volume", 6
+        elif volume >= 250_000:
+            label, score = "Usable extended-hours volume", 3
+        elif volume >= 50_000:
+            label, score = "Thin extended-hours volume", -5
+        else:
+            label, score = "Very thin extended-hours volume", -10
+    else:
+        if volume >= 10_000_000:
+            label, score = "Very liquid", 6
+        elif volume >= 2_000_000:
+            label, score = "Good liquidity", 4
+        elif volume >= 500_000:
+            label, score = "Moderate liquidity", 0
+        else:
+            label, score = "Low liquidity", -8
+
+    return {"label": label, "score": score, "volume": volume}
+
+
+def candidate_confidence(candidate, session_name):
+    """Convert verified evidence into a cautious confidence label."""
+    validation = candidate.get("validation") or {}
+    setup = candidate.get("setup") or {}
+    statistics = validation.get("statistics") or {}
+    edge_grade = validation.get("historical_grade")
+    macro = validation.get("macro_alignment")
+    earnings = validation.get("earnings_risk")
+    verdict = validation.get("final_verdict", "")
+    final_score = int(validation.get("final_score") or 0)
+    setup_quality = int(setup.get("setup_quality") or 0)
+    liquidity = candidate_liquidity_assessment(candidate, session_name)
+
+    oos = statistics.get("out_of_sample") or {}
+    oos_trades = int(oos.get("trades") or 0)
+    oos_average = float(oos.get("average_return") or 0.0)
+    stable = int(statistics.get("positive_stability_periods") or 0)
+    stability_periods = int(statistics.get("stability_period_count") or 0)
+
+    verified = "CANDIDATE" in verdict
+    hard_block = (
+        not verified
+        or macro == "Opposing"
+        or earnings == "High"
+        or edge_grade in {"NEGATIVE", "INSUFFICIENT"}
+        or liquidity["score"] <= -8
+    )
+
+    if hard_block:
+        return {
+            "label": "NO TRADE",
+            "rank": 0,
+            "selection_score": final_score + liquidity["score"],
+            "liquidity": liquidity,
+            "explanation": "One or more required confidence checks failed.",
+        }
+
+    high_confidence = (
+        edge_grade == "STRONG"
+        and setup_quality >= 80
+        and macro == "Supportive"
+        and earnings in {"Low", "Upcoming", "Unknown"}
+        and final_score >= 100
+        and oos_trades >= 10
+        and oos_average > 0
+        and (stability_periods < 3 or stable == stability_periods)
+        and liquidity["score"] >= 0
+    )
+    if high_confidence:
+        return {
+            "label": "HIGH",
+            "rank": 3,
+            "selection_score": final_score + 18 + liquidity["score"],
+            "liquidity": liquidity,
+            "explanation": "Strong historical evidence, supportive context, and no major blocking risk.",
+        }
+
+    moderate_confidence = (
+        edge_grade in {"STRONG", "MODERATE"}
+        and setup_quality >= 70
+        and macro != "Opposing"
+        and earnings != "High"
+        and oos_average > 0
+        and final_score >= 78
+        and liquidity["score"] > -8
+    )
+    if moderate_confidence:
+        return {
+            "label": "MODERATE",
+            "rank": 2,
+            "selection_score": final_score + 8 + liquidity["score"],
+            "liquidity": liquidity,
+            "explanation": "The evidence is positive, but not strong enough to call high confidence.",
+        }
+
+    return {
+        "label": "LOW — WATCH ONLY",
+        "rank": 1,
+        "selection_score": final_score + liquidity["score"],
+        "liquidity": liquidity,
+        "explanation": "Some evidence is positive, but confidence requirements were not fully met.",
+    }
+
+
+def candidate_session_action(candidate, session):
+    """Translate one verified setup into an action appropriate for the market session."""
+    confidence = candidate.get("confidence") or candidate_confidence(candidate, session["name"])
+    if confidence["rank"] < 2:
+        return {
+            "label": "NO TRADE",
+            "detail": "Keep scanning or wait for conditions to improve.",
+        }
+
+    direction = candidate.get("direction")
+    plan = candidate.get("plan") or {}
+    quote = candidate.get("quote") or {}
+    current_price = quote.get("price")
+    entry = plan.get("entry")
+
+    if session["name"] == "premarket":
+        return {
+            "label": "WATCH FOR THE OPEN",
+            "detail": "Use the opening reaction to confirm the setup; do not treat a premarket quote as an automatic fill.",
+        }
+    if session["name"] == "afterhours":
+        return {
+            "label": "WATCH FOR NEXT SESSION",
+            "detail": "After-hours liquidity can be thin. Recheck the setup before the next regular session.",
+        }
+    if session["name"] == "closed":
+        return {
+            "label": "PLAN FOR NEXT SESSION",
+            "detail": "This is the strongest setup from the latest completed data, not an immediate trade.",
+        }
+
+    if current_price is not None and entry is not None and direction:
+        current_price = float(current_price)
+        entry = float(entry)
+        chase_tolerance = max(0.02, entry * 0.004)
+        if direction == "LONG" and current_price > entry + chase_tolerance:
+            return {
+                "label": "WAIT FOR ENTRY — DO NOT CHASE",
+                "detail": f"The live price is above the planned entry near ${entry:.2f}.",
+            }
+        if direction == "SHORT" and current_price < entry - chase_tolerance:
+            return {
+                "label": "WAIT FOR ENTRY — DO NOT CHASE",
+                "detail": f"The live price is below the planned short entry near ${entry:.2f}.",
+            }
+
+    return {
+        "label": "TRADE SETUP AVAILABLE",
+        "detail": "The planned entry remains close to the latest available price. Confirm the live quote before acting.",
+    }
+
+
+def enrich_and_rank_finder_results(results, session):
+    """Attach confidence/action fields and rank strongest verified candidates first."""
+    enriched = []
+    for item in results:
+        if "error" in item:
+            continue
+        item = dict(item)
+        item["confidence"] = candidate_confidence(item, session["name"])
+        item["session_action"] = candidate_session_action(item, session)
+        enriched.append(item)
+
+    enriched.sort(
+        key=lambda item: (
+            item["confidence"]["rank"],
+            item["confidence"]["selection_score"],
+            int((item.get("setup") or {}).get("setup_quality") or 0),
+        ),
+        reverse=True,
+    )
+    return enriched
+
+
+def run_finder_scan(candidate_items, status):
+    """Run the shared technical and deep-validation pipeline."""
+    results = []
+    progress = st.progress(0)
+    for index, candidate in enumerate(candidate_items):
+        symbol = candidate["ticker"]
+        status.caption(f"Technical analysis {index + 1} of {len(candidate_items)} — {symbol}")
+        try:
+            snapshot = build_stock_snapshot(symbol, "1y")
+            snapshot["finder_sources"] = candidate.get("sources", [])
+            snapshot["session_change_percent"] = candidate.get("session_change_percent")
+            snapshot["session_volume"] = candidate.get("session_volume")
+            results.append(snapshot)
+        except Exception as error:
+            results.append({
+                "ticker": symbol,
+                "finder_sources": candidate.get("sources", []),
+                "error": str(error),
+            })
+        progress.progress((index + 1) / max(len(candidate_items), 1))
+
+    usable = [item for item in results if "error" not in item]
+    validation_pool = sorted(
+        [
+            item for item in usable
+            if item.get("direction") and item["setup"]["setup_quality"] >= 55
+        ],
+        key=lambda item: item["setup"]["setup_quality"],
+        reverse=True,
+    )[:8]
+    validation_symbols = {item["ticker"] for item in validation_pool}
+
+    for index, candidate in enumerate(validation_pool):
+        status.caption(
+            f"Deep validation {index + 1} of {len(validation_pool)} — {candidate['ticker']}"
+        )
+        try:
+            validated = validate_finder_candidate(candidate)
+            for position, existing in enumerate(results):
+                if existing.get("ticker") == candidate["ticker"]:
+                    results[position] = validated
+                    break
+        except Exception as error:
+            candidate["validation"] = {
+                "final_verdict": "WATCH — VALIDATION UNAVAILABLE",
+                "verdict_kind": "warning",
+                "historical_label": "Validation unavailable",
+                "historical_grade": "INSUFFICIENT",
+                "macro_alignment": "Unavailable",
+                "earnings_risk": "Unknown",
+                "earnings_label": "Earnings date unavailable",
+                "final_score": candidate["setup"]["setup_quality"] - 10,
+                "reasons": [f"Validation could not be completed: {error}"],
+                "statistics": None,
+            }
+
+    for item in usable:
+        if item["ticker"] not in validation_symbols:
+            item["validation"] = {
+                "final_verdict": "NOT FULLY VALIDATED",
+                "verdict_kind": "info",
+                "historical_label": "Outside validation shortlist",
+                "historical_grade": "INSUFFICIENT",
+                "macro_alignment": "Not checked",
+                "earnings_risk": "Unknown",
+                "earnings_label": "Not checked",
+                "final_score": item["setup"]["setup_quality"] - 15,
+                "reasons": [
+                    "This ticker did not rank in the top eight technical leans, so slower validation was skipped."
+                ],
+                "statistics": None,
+            }
+
+    progress.empty()
+    status.empty()
+    return results
+
+
+def render_best_trade_card(item, session):
+    """Render the single primary Finder result."""
+    setup = item["setup"]
+    quote = item["quote"]
+    plan = item.get("plan")
+    validation = item["validation"]
+    confidence = item["confidence"]
+    action = item["session_action"]
+    session_change = item.get("session_change_percent")
+    sources = ", ".join(item.get("finder_sources") or [])
+
+    with st.container(border=True):
+        st.markdown(f"## {item['ticker']} — {item.get('direction') or 'WAIT'}")
+        st.markdown(f"### {action['label']}")
+        st.write(action["detail"])
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            render_summary_card("Confidence", confidence["label"])
+        with c2:
+            render_summary_card("Setup", f"{setup['setup_quality']} / 100")
+        with c3:
+            render_summary_card("Historical edge", validation.get("historical_label", "—"))
+        with c4:
+            render_summary_card("Macro", validation.get("macro_alignment", "—"))
+
+        st.caption(
+            "Confidence is an evidence grade, not a guaranteed probability of profit."
+        )
+        st.write(
+            f"**Earnings:** {validation.get('earnings_label', 'Date unavailable')}  •  "
+            f"**Liquidity:** {confidence['liquidity']['label']}  •  "
+            "**Tested style:** short swing, up to 3 sessions"
+        )
+        if quote.get("price") is not None:
+            latest_text = f"**Latest:** ${float(quote['price']):.2f}"
+            if session_change is not None:
+                latest_text += f" • **Session move:** {float(session_change):+.2f}%"
+            st.write(latest_text)
+        if plan:
+            st.write(
+                f"**Plan:** Entry ${plan['entry']:.2f} • Stop ${plan['stop']:.2f} • "
+                f"Target ${plan['target']:.2f} • R:R {plan['reward_to_risk']:.1f}:1"
+            )
+        if sources:
+            st.caption(f"Found through: {sources}")
+
+        st.markdown("**Why this ranked first**")
+        st.write(f"• {confidence['explanation']}")
+        for reason in validation.get("reasons", [])[:4]:
+            st.write(f"• {reason}")
+
+        st.button(
+            "View Full Decision",
+            key=f"best_trade_view_{item['ticker']}",
+            type="primary",
+            use_container_width=True,
+            on_click=open_analysis_for,
+            args=(item["ticker"],),
+        )
+
+
 def render_trade_finder():
-    st.header("Find a Trade")
+    st.header("Find Best Trade Now")
+    st.caption("v23 • Session-aware ranked Trade Finder")
     st.caption(
-        "The scanner first finds movers, then validates only the strongest technical leans "
-        "with a direction-specific historical test and ticker-aware macro context."
+        "One button searches the current session, deeply validates the strongest setups, "
+        "and returns a ranked shortlist of qualified choices—or No Trade."
     )
 
     session = get_market_session()
-    st.caption(
-        f"**Current scanner session: {session['label']}.** "
-        + (
-            "Extended-hours prices and volume are used from 4:00–9:30 AM ET."
-            if session["name"] == "premarket"
-            else "Live regular-session mover data is used."
-            if session["name"] == "regular"
-            else "Extended-hours prices and volume are used from 4:00–8:00 PM ET."
-            if session["name"] == "afterhours"
-            else "The latest available regular-session screens are used until premarket opens."
+    session_message = {
+        "premarket": "The scanner uses extended-hours movement and looks for a setup to confirm at the open.",
+        "regular": "The scanner uses current regular-session movers and checks whether an entry is still available.",
+        "afterhours": "The scanner uses after-hours movement and looks for a setup to recheck next session.",
+        "closed": "The scanner uses the latest completed data to prepare for the next session.",
+    }[session["name"]]
+    st.info(f"**{session['label']} mode.** {session_message}")
+
+    market_scan_clicked = st.button(
+        "🔎 Find Best Trade Now",
+        type="primary",
+        use_container_width=True,
+    )
+
+    custom_scan_clicked = False
+    custom_symbols = []
+    with st.expander("Optional: Scan My List"):
+        finder_watchlist = st.text_input(
+            "Tickers to scan",
+            "AAL, INTC, BA, KO, CVX, XOM, NVDA, AMD",
+            help="Separate ticker symbols with commas. Up to 12.",
         )
-    )
+        custom_scan_clicked = st.button(
+            "Scan My List",
+            use_container_width=True,
+        )
+        if custom_scan_clicked:
+            custom_symbols = parse_watchlist(finder_watchlist, "")[:12]
 
-    scan_mode = st.radio(
-        "Finder mode",
-        ["Scan the Market", "Scan My List"],
-        key="finder_scan_mode",
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    with st.container(border=True):
-        if scan_mode == "Scan the Market":
-            st.markdown("### Search current market movers")
-            st.caption(
-                "Collects a broad pool, pre-ranks it with current-session data, deeply analyzes "
-                "24 names, then validates the strongest eight."
-            )
-            scan_clicked = st.button("Scan the Market", type="primary", use_container_width=True)
-        else:
-            st.markdown("### Search tickers you choose")
-            finder_watchlist = st.text_input(
-                "Tickers to scan",
-                "AAL, INTC, BA, KO, CVX, XOM, NVDA, AMD",
-                help="Separate ticker symbols with commas. Up to 12.",
-            )
-            scan_clicked = st.button("Scan My List", type="primary", use_container_width=True)
-
-    if scan_clicked:
+    if market_scan_clicked or custom_scan_clicked:
         status = st.empty()
-        if scan_mode == "Scan the Market":
-            status.caption("Collecting a broad online mover pool…")
+        if market_scan_clicked:
+            st.session_state.finder_scan_mode = "Scan the Market"
+            status.caption("Collecting current movers and liquid stocks…")
             scan_payload = get_market_scan_candidates(max_pool=220)
             status.caption(
                 f"Pre-ranking {len(scan_payload['candidates'])} candidates using "
@@ -3362,9 +3838,9 @@ def render_trade_finder():
                 deep_limit=24,
             )
             scan_summary["session_label"] = scan_payload["session_label"]
-            st.session_state.finder_scan_summary = scan_summary
+            scan_summary["scanned_at"] = datetime.now(ZoneInfo("America/New_York")).isoformat()
         else:
-            symbols = parse_watchlist(finder_watchlist, "")[:12]
+            st.session_state.finder_scan_mode = "Scan My List"
             candidate_items = [
                 {
                     "ticker": symbol,
@@ -3373,183 +3849,169 @@ def render_trade_finder():
                     "session_change_percent": None,
                     "session_volume": None,
                 }
-                for symbol in symbols
+                for symbol in custom_symbols
             ]
-            st.session_state.finder_scan_summary = {
+            scan_summary = {
                 "pool_count": len(candidate_items),
                 "ranked_count": len(candidate_items),
                 "deep_count": len(candidate_items),
                 "session_name": session["name"],
                 "session_label": session["label"],
+                "scanned_at": datetime.now(ZoneInfo("America/New_York")).isoformat(),
             }
 
+        st.session_state.finder_scan_summary = scan_summary
         if not candidate_items:
             status.empty()
             st.session_state.finder_results = []
             st.warning("No candidate tickers were returned.")
         else:
-            results = []
-            progress = st.progress(0)
-            for index, candidate in enumerate(candidate_items):
-                symbol = candidate["ticker"]
-                status.caption(f"Technical analysis {index + 1} of {len(candidate_items)} — {symbol}")
-                try:
-                    snapshot = build_stock_snapshot(symbol, "1y")
-                    snapshot["finder_sources"] = candidate.get("sources", [])
-                    snapshot["session_change_percent"] = candidate.get("session_change_percent")
-                    snapshot["session_volume"] = candidate.get("session_volume")
-                    results.append(snapshot)
-                except Exception as error:
-                    results.append({"ticker": symbol, "finder_sources": candidate.get("sources", []), "error": str(error)})
-                progress.progress((index + 1) / max(len(candidate_items), 1))
+            st.session_state.finder_results = run_finder_scan(candidate_items, status)
 
-            usable = [item for item in results if "error" not in item]
-            validation_pool = sorted(
-                [item for item in usable if item.get("direction") and item["setup"]["setup_quality"] >= 55],
-                key=lambda item: item["setup"]["setup_quality"],
-                reverse=True,
-            )[:8]
-            validation_symbols = {item["ticker"] for item in validation_pool}
-
-            for index, candidate in enumerate(validation_pool):
-                status.caption(
-                    f"Historical and macro validation {index + 1} of {len(validation_pool)} — {candidate['ticker']}"
-                )
-                try:
-                    validated = validate_finder_candidate(candidate)
-                    for position, existing in enumerate(results):
-                        if existing.get("ticker") == candidate["ticker"]:
-                            results[position] = validated
-                            break
-                except Exception as error:
-                    candidate["validation"] = {
-                        "final_verdict": "WATCH — VALIDATION UNAVAILABLE",
-                        "verdict_kind": "warning",
-                        "historical_label": "Validation unavailable",
-                        "macro_alignment": "Unavailable",
-                        "final_score": candidate["setup"]["setup_quality"] - 10,
-                        "reasons": [f"Validation could not be completed: {error}"],
-                        "statistics": None,
-                    }
-
-            for item in usable:
-                if item["ticker"] not in validation_symbols:
-                    item["validation"] = {
-                        "final_verdict": "NOT FULLY VALIDATED",
-                        "verdict_kind": "info",
-                        "historical_label": "Outside validation shortlist",
-                        "macro_alignment": "Not checked",
-                        "final_score": item["setup"]["setup_quality"] - 15,
-                        "reasons": ["This ticker did not rank in the top eight technical leans, so the slower historical validation was skipped."],
-                        "statistics": None,
-                    }
-
-            progress.empty()
-            status.empty()
-            st.session_state.finder_results = results
-
-    results = st.session_state.finder_results
+    results = st.session_state.get("finder_results")
     scan_summary = st.session_state.get("finder_scan_summary")
     if scan_summary:
         st.caption(
             f"Last scan: {scan_summary.get('session_label', 'Market')} • "
-            f"{scan_summary.get('pool_count', 0)} candidates collected • "
-            f"{scan_summary.get('ranked_count', 0)} had usable mover data • "
-            f"{scan_summary.get('deep_count', 0)} technically analyzed • up to 8 historically validated."
+            f"{scan_summary.get('pool_count', 0)} collected • "
+            f"{scan_summary.get('ranked_count', 0)} with usable mover data • "
+            f"{scan_summary.get('deep_count', 0)} technically analyzed • up to 8 deeply validated"
         )
 
     if not results:
-        st.info("Choose a scan mode and press its scan button.")
+        st.info("Press **Find Best Trade Now** to run the session-aware scan.")
         return
 
-    usable = [item for item in results if "error" not in item]
-    candidates = [
-        item for item in usable
-        if "CANDIDATE" in (item.get("validation") or {}).get("final_verdict", "")
-    ]
-    candidates.sort(key=lambda item: item["validation"]["final_score"], reverse=True)
-
-    if not candidates:
-        st.info(
-            "No historically verified trade candidate was found. Some charts may lean long or short, "
-            "but the app is recommending Watch or Wait rather than overstating the evidence."
-        )
-        display_items = sorted(
-            [item for item in usable if item.get("validation")],
-            key=lambda item: item["validation"]["final_score"],
-            reverse=True,
-        )[:3]
-        heading = "Closest watchlist setups"
+    scanned_at = pd.to_datetime((scan_summary or {}).get("scanned_at"), errors="coerce")
+    scan_session_name = (scan_summary or {}).get("session_name")
+    stale_reasons = []
+    if scan_session_name and scan_session_name != session["name"]:
+        stale_reasons.append("the market session changed")
+    if pd.isna(scanned_at):
+        stale_reasons.append("the scan predates this version")
     else:
-        display_items = candidates[:3]
-        heading = "Verified current candidates"
+        if scanned_at.tzinfo is None:
+            scanned_at = scanned_at.tz_localize("America/New_York")
+        else:
+            scanned_at = scanned_at.tz_convert("America/New_York")
+        age_minutes = (pd.Timestamp.now(tz="America/New_York") - scanned_at).total_seconds() / 60
+        freshness_limit = 20 if session["name"] == "regular" else 45
+        if age_minutes > freshness_limit:
+            stale_reasons.append(f"the results are about {int(age_minutes)} minutes old")
 
-    st.subheader(heading)
-    for rank, item in enumerate(display_items, start=1):
-        setup = item["setup"]
-        quote = item["quote"]
-        plan = item["plan"]
-        validation = item["validation"]
-        sources = ", ".join(item.get("finder_sources") or [])
-        session_change = item.get("session_change_percent")
+    if stale_reasons:
+        st.warning(
+            "These results are stale because " + " and ".join(stale_reasons) + ". "
+            "Press **Find Best Trade Now** again before treating anything as the current best setup."
+        )
+        return
 
-        with st.container(border=True):
-            st.markdown(f"### {rank}. {item['ticker']} — {validation['final_verdict']}")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                render_summary_card("Technical lean", item.get("direction") or "WAIT")
-            with c2:
-                render_summary_card("Setup", f"{setup['setup_quality']} / 100")
-            with c3:
-                render_summary_card("Historical edge", validation["historical_label"])
-            with c4:
-                render_summary_card("Macro", validation["macro_alignment"])
-            if quote.get("price"):
-                st.write(
-                    f"**Latest:** ${quote['price']:.2f}"
-                    + (f" • **Session:** {session_change:+.2f}%" if session_change is not None else "")
-                )
-            if sources:
-                st.caption(f"Found through: {sources}")
-            if plan:
-                st.write(
-                    f"**Hypothetical plan:** Entry ${plan['entry']:.2f} • Stop ${plan['stop']:.2f} • "
-                    f"Target ${plan['target']:.2f} • R:R {plan['reward_to_risk']:.1f}:1"
-                )
-            for reason in validation["reasons"][:3]:
-                st.write(f"• {reason}")
-            st.button(
-                "View Decision",
-                key=f"finder_view_{item['ticker']}",
-                type="primary" if rank == 1 else "secondary",
-                use_container_width=True,
-                on_click=open_analysis_for,
-                args=(item["ticker"],),
+    ranked = enrich_and_rank_finder_results(results, session)
+    confident = [item for item in ranked if item["confidence"]["rank"] >= 2]
+
+    if confident:
+        qualified = confident[:5]
+        best = qualified[0]
+        st.success(
+            f"{len(qualified)} qualified choice{'s' if len(qualified) != 1 else ''} found. "
+            f"Top-ranked: {best['ticker']} • {best['confidence']['label']} confidence • "
+            f"{best['session_action']['label']}"
+        )
+        st.caption(
+            "The first result ranks highest, but the other qualified choices remain visible so "
+            "you can compare the setup, historical edge, macro support, and entry before deciding."
+        )
+        render_best_trade_card(best, session)
+
+        alternatives = qualified[1:]
+        if alternatives:
+            st.subheader("Other qualified choices")
+            for rank, item in enumerate(alternatives, start=2):
+                validation = item["validation"]
+                plan = item.get("plan")
+                confidence = item.get("confidence") or {}
+                with st.container(border=True):
+                    st.markdown(
+                        f"### {rank}. {item['ticker']} — {confidence.get('label', '—')} confidence"
+                    )
+                    st.write(
+                        f"**Action:** {item['session_action']['label']}  •  "
+                        f"**Technical:** {item.get('direction') or 'WAIT'}  •  "
+                        f"**Historical:** {validation.get('historical_label', '—')}  •  "
+                        f"**Macro:** {validation.get('macro_alignment', '—')}  •  "
+                        f"**Earnings:** {validation.get('earnings_label', '—')}"
+                    )
+                    if plan:
+                        st.write(
+                            f"**Plan:** Entry ${plan['entry']:.2f} • Stop ${plan['stop']:.2f} • "
+                            f"Target ${plan['target']:.2f} • R:R {plan['reward_to_risk']:.1f}:1"
+                        )
+                    reasons = validation.get("reasons", [])
+                    if reasons:
+                        st.caption("Why it qualified: " + " ".join(reasons[:2]))
+                    st.button(
+                        "View Full Decision",
+                        key=f"ranked_choice_view_{rank}_{item['ticker']}",
+                        use_container_width=True,
+                        on_click=open_analysis_for,
+                        args=(item["ticker"],),
+                    )
+        else:
+            st.info(
+                "Only one setup met the confidence requirements in this scan. "
+                "The app is not adding weaker names just to create more choices."
             )
+    else:
+        st.warning("## No confident trade right now")
+        st.write(
+            "The strongest setups failed one or more required checks. The app is choosing No Trade "
+            "instead of forcing a recommendation."
+        )
+        closest = ranked[:3]
+        if closest:
+            with st.expander("See the closest watch-only setups"):
+                for item in closest:
+                    validation = item.get("validation") or {}
+                    st.markdown(
+                        f"**{item['ticker']} — {validation.get('final_verdict', 'Watch')}**"
+                    )
+                    st.caption(
+                        f"Technical {item.get('direction') or 'WAIT'} • "
+                        f"Setup {item['setup']['setup_quality']}/100 • "
+                        f"Historical {validation.get('historical_label', '—')} • "
+                        f"Macro {validation.get('macro_alignment', '—')}"
+                    )
 
-    with st.expander("All deeply analyzed results"):
+    with st.expander("See all analyzed stocks and scan details"):
         rows = []
-        for item in usable:
+        for item in ranked:
             validation = item.get("validation") or {}
+            confidence = item.get("confidence") or {}
             rows.append(
                 {
                     "Ticker": item["ticker"],
                     "Source": ", ".join(item.get("finder_sources") or []),
-                    "Session move": f"{item.get('session_change_percent'):+.2f}%" if item.get("session_change_percent") is not None else "—",
+                    "Session move": (
+                        f"{item.get('session_change_percent'):+.2f}%"
+                        if item.get("session_change_percent") is not None
+                        else "—"
+                    ),
                     "Technical lean": item.get("direction") or "WAIT",
                     "Setup": item["setup"]["setup_quality"],
+                    "Confidence": confidence.get("label", "—"),
+                    "Action": (item.get("session_action") or {}).get("label", "—"),
                     "Final verdict": validation.get("final_verdict", "Not validated"),
                     "Historical edge": validation.get("historical_label", "—"),
                     "Macro": validation.get("macro_alignment", "—"),
+                    "Earnings": validation.get("earnings_label", "—"),
                 }
             )
         if rows:
             st.dataframe(
-                pd.DataFrame(rows).sort_values(["Setup", "Ticker"], ascending=[False, True]),
+                pd.DataFrame(rows),
                 hide_index=True,
                 use_container_width=True,
             )
-
 
 def render_analyze():
     pending_ticker = st.session_state.get("pending_analysis_ticker")
@@ -3621,8 +4083,9 @@ def render_analyze():
         with top4:
             render_summary_card("Historical edge", validation["historical_label"])
         st.write(f"**Ticker-aware macro:** {validation['macro_alignment']}")
+        st.write(f"**Earnings:** {validation.get('earnings_label', 'Date unavailable')}  •  **Tested style:** short swing, up to 3 sessions")
 
-        for reason in validation.get("reasons", [])[:4]:
+        for reason in validation.get("reasons", [])[:5]:
             st.write(f"• {reason}")
 
         if plan:
@@ -3651,11 +4114,9 @@ def render_analyze():
 
         if original_entry_waiting and live_price is not None:
             st.warning(
-                f"The original entry has not filled. Current price: ${live_price:.2f}. "
-                f"Recommended entry: ${recommended_entry:.2f}. Do not chase without "
-                "creating a new setup."
+                f"The original setup entry is not available now. Current price: ${live_price:.2f}. "
+                f"Plan entry: ${recommended_entry:.2f}. Wait for the level or recalculate instead of chasing."
             )
-
             if st.button(
                 "Recalculate setup from current price",
                 use_container_width=True,
@@ -3672,18 +4133,12 @@ def render_analyze():
                 st.session_state.analysis_result["quote"] = live_quote
                 st.rerun()
 
-        with st.expander("Paper trade or filled trade", expanded=True):
+        with st.expander("Add to Active Trades (optional)", expanded=False):
             st.caption(
-                "Entry, stop, and target are editable. When Paper trade is checked, "
-                "the app saves an unfilled entry as Pending and a currently fillable "
-                "entry as Active."
+                "Use this only after you actually enter the trade in a broker or paper account. "
+                "Active Trades is an organizer, not an order queue."
             )
-            st.caption(
-                f"Original scanner plan — Entry ${plan['entry']:.2f} · "
-                f"Stop ${plan['stop']:.2f} · Target ${plan['target']:.2f}"
-            )
-
-            with st.form(f"editable_decision_entry_{ticker}_{result['direction']}"):
+            with st.form(f"optional_active_entry_{ticker}_{result['direction']}"):
                 c1, c2 = st.columns(2)
                 with c1:
                     quantity = st.number_input(
@@ -3691,20 +4146,20 @@ def render_analyze():
                         min_value=1,
                         value=1,
                         step=1,
-                        key=f"editable_qty_{ticker}_{result['direction']}",
+                        key=f"active_qty_{ticker}_{result['direction']}",
                     )
                     entry = st.number_input(
-                        "Entry price",
+                        "Actual fill price",
                         min_value=0.01,
-                        value=float(plan["entry"]),
+                        value=float(live_price or plan["entry"]),
                         step=0.01,
                         format="%.2f",
-                        key=f"editable_entry_{ticker}_{result['direction']}",
+                        key=f"active_entry_{ticker}_{result['direction']}",
                     )
                     paper_trade = st.checkbox(
                         "Paper trade",
                         value=True,
-                        key=f"editable_paper_{ticker}_{result['direction']}",
+                        key=f"active_paper_{ticker}_{result['direction']}",
                     )
                 with c2:
                     stop = st.number_input(
@@ -3713,7 +4168,7 @@ def render_analyze():
                         value=float(plan["stop"]),
                         step=0.01,
                         format="%.2f",
-                        key=f"editable_stop_{ticker}_{result['direction']}",
+                        key=f"active_stop_{ticker}_{result['direction']}",
                     )
                     target = st.number_input(
                         "Target price",
@@ -3721,11 +4176,14 @@ def render_analyze():
                         value=float(plan["target"]),
                         step=0.01,
                         format="%.2f",
-                        key=f"editable_target_{ticker}_{result['direction']}",
+                        key=f"active_target_{ticker}_{result['direction']}",
                     )
-
+                confirmed = st.checkbox(
+                    "I actually entered this trade at the fill price above",
+                    key=f"active_confirm_{ticker}_{result['direction']}",
+                )
                 save_clicked = st.form_submit_button(
-                    "Save paper trade / order" if paper_trade else "Record filled trade",
+                    "Add entered trade",
                     type="primary",
                     use_container_width=True,
                 )
@@ -3737,87 +4195,35 @@ def render_analyze():
                     if direction == "LONG"
                     else target < entry < stop
                 )
-
                 if not levels_valid:
                     st.error(
-                        "Check the levels. For a long trade: stop < entry < target. "
-                        "For a short trade: target < entry < stop."
+                        "Check the levels. For a long: stop < entry < target. "
+                        "For a short: target < entry < stop."
                     )
+                elif not confirmed:
+                    st.error("Confirm that you actually entered the trade before adding it to Active Trades.")
                 else:
                     try:
-                        submit_quote = get_latest_quote(ticker)
-                        submit_price = float(submit_quote.get("price"))
-                    except Exception:
-                        submit_price = None
-
-                    waiting = (
-                        True
-                        if submit_price is None
-                        else entry_is_waiting(direction, entry, submit_price)
-                    )
-
-                    if paper_trade and waiting:
-                        try:
-                            add_pending_paper_order(
-                                supabase,
-                                st.session_state.supabase_user_id,
-                                {
-                                    "ticker": ticker,
-                                    "direction": direction,
-                                    "quantity": int(quantity),
-                                    "entry": float(entry),
-                                    "stop": float(stop),
-                                    "target": float(target),
-                                },
-                            )
-                            price_note = (
-                                f" Current price: ${submit_price:.2f}."
-                                if submit_price is not None
-                                else " Live price was unavailable, so it was kept Pending."
-                            )
-                            st.success(
-                                f"Pending paper order saved for {ticker} at "
-                                f"${float(entry):.2f}.{price_note}"
-                            )
-                        except Exception as error:
-                            st.error(f"Pending order could not be saved: {error}")
-                    elif not paper_trade and waiting:
-                        st.error(
-                            "That entry has not filled at the current market price. "
-                            "Use Paper trade to save it as Pending, or record the actual "
-                            "filled price."
+                        add_cloud_trade(
+                            supabase,
+                            st.session_state.supabase_user_id,
+                            {
+                                "ticker": ticker,
+                                "direction": direction,
+                                "quantity": int(quantity),
+                                "entry": float(entry),
+                                "stop": float(stop),
+                                "target": float(target),
+                                "notes": (
+                                    "PAPER TRADE | Entered from app decision"
+                                    if paper_trade
+                                    else "Entered from app decision"
+                                ),
+                            },
                         )
-                    else:
-                        try:
-                            add_cloud_trade(
-                                supabase,
-                                st.session_state.supabase_user_id,
-                                {
-                                    "ticker": ticker,
-                                    "direction": direction,
-                                    "quantity": int(quantity),
-                                    "entry": float(entry),
-                                    "stop": float(stop),
-                                    "target": float(target),
-                                    "notes": (
-                                        "PAPER TRADE | Entry currently fillable"
-                                        if paper_trade
-                                        else "Manually recorded filled trade"
-                                    ),
-                                },
-                            )
-                            st.success(
-                                f"{ticker} was added to Active Trades at "
-                                f"${float(entry):.2f}."
-                            )
-                        except Exception as error:
-                            st.error(f"Trade could not be saved: {error}")
-
-        st.caption(
-            "Pending paper orders are checked whenever Active Trades loads or "
-            "you press Refresh & check orders. The app cannot monitor while it "
-            "is completely closed."
-        )
+                        st.success(f"{ticker} was added to Active Trades.")
+                    except Exception as error:
+                        st.error(f"Trade could not be saved: {error}")
     elif plan and not final_is_candidate:
         st.info("Trade entry is withheld because the final evidence does not confirm this setup. You can still add a trade manually from Active Trades.")
     elif plan and not logged_in:
@@ -3865,43 +4271,19 @@ def render_analyze():
 def render_active_trades():
     st.header("Active Trades")
     st.caption(
-        "Active positions, pending paper entries, current P/L, stops, targets, "
-        "and trade history."
+        "Optional organizer for trades you actually entered from the app. "
+        "It tracks price, P/L, stop, target, and your history; it does not place or queue orders."
     )
 
     if not logged_in:
-        st.info("Sign in from the sidebar to view and sync trades.")
+        st.info("Sign in from the sidebar to organize active trades.")
         return
 
-    refresh_col, active_count_col, pending_count_col = st.columns(3)
-    if refresh_col.button("Refresh & check orders", use_container_width=True):
+    refresh_col, active_count_col = st.columns(2)
+    if refresh_col.button("Refresh prices", use_container_width=True):
         get_latest_quote.clear()
         get_latest_trade_price.clear()
-        check_pending_limit_fill.clear()
         st.rerun()
-
-    try:
-        pending_orders = load_pending_orders(
-            supabase,
-            st.session_state.supabase_user_id,
-        )
-        filled_symbols, pending_checks = sync_pending_orders(
-            supabase,
-            pending_orders,
-        )
-        if filled_symbols:
-            st.success(
-                "Filled pending paper order(s): "
-                + ", ".join(sorted(set(filled_symbols)))
-            )
-            pending_orders = load_pending_orders(
-                supabase,
-                st.session_state.supabase_user_id,
-            )
-    except Exception as error:
-        pending_orders = []
-        pending_checks = {}
-        st.error(f"Pending orders could not be checked: {error}")
 
     try:
         active_trades = load_cloud_trades(
@@ -3913,71 +4295,10 @@ def render_active_trades():
         st.error(f"Cloud trades could not be loaded: {error}")
 
     active_count_col.metric("Active trades", len(active_trades))
-    pending_count_col.metric("Pending orders", len(pending_orders))
-
-    if pending_orders:
-        st.subheader("Pending Paper Orders")
-        st.caption(
-            "These are limit entries waiting for the recommended price. They are "
-            "checked whenever this page loads or Refresh & check orders is pressed."
-        )
-
-        for order in pending_orders:
-            entry = float(order["entry_price"])
-            stop = float(order["stop_price"])
-            target = float(order["target_price"])
-            quantity = int(order.get("quantity") or 1)
-            check = pending_checks.get(order["id"], {})
-            current = check.get("current_price")
-
-            with st.container(border=True):
-                title_col, side_col = st.columns([3, 1])
-                title_col.markdown(f"### {order['ticker']} · Pending")
-                side_col.markdown(
-                    f"**{order['direction']} · {quantity} paper share(s)**"
-                )
-
-                if current is None:
-                    st.warning("Current price could not be loaded.")
-                else:
-                    if order["direction"] == "LONG":
-                        distance = float(current) - entry
-                        waiting_text = (
-                            f"Waiting for a pullback of ${max(0.0, distance):.2f}"
-                            if distance > 0
-                            else "Entry condition is at or through the limit"
-                        )
-                    else:
-                        distance = entry - float(current)
-                        waiting_text = (
-                            f"Waiting for a rise of ${max(0.0, distance):.2f}"
-                            if distance > 0
-                            else "Entry condition is at or through the limit"
-                        )
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Current", f"${float(current):.2f}")
-                    m2.metric("Limit entry", f"${entry:.2f}")
-                    m3.metric("Status", "WAITING")
-                    st.write(waiting_text)
-
-                st.write(
-                    f"**Stop:** ${stop:.2f}  •  **Target:** ${target:.2f}"
-                )
-                if st.button(
-                    "Cancel pending order",
-                    key=f"cancel_pending_{order['id']}",
-                    use_container_width=True,
-                ):
-                    try:
-                        cancel_pending_order(supabase, order["id"])
-                        st.rerun()
-                    except Exception as error:
-                        st.error(f"Pending order could not be cancelled: {error}")
 
     if not active_trades:
-        st.info("No active trades yet.")
+        st.info("No active trades are being organized right now.")
     else:
-        st.subheader("Active Positions")
         for trade in active_trades:
             entry = float(trade["entry_price"])
             stop = float(trade["stop_price"])
@@ -4019,10 +4340,9 @@ def render_active_trades():
                         except Exception as error:
                             st.error(f"Trade close failed: {error}")
 
-    with st.expander("Record an already-filled trade"):
+    with st.expander("Add a trade you already entered"):
         st.caption(
-            "Use this only for a position that has already filled in your broker or paper account. "
-            "Unfilled scanner recommendations belong under Pending Paper Orders."
+            "This is optional. Use it after a real or paper position has actually filled."
         )
         with st.form("clean_add_trade", clear_on_submit=True):
             c1, c2 = st.columns(2)
@@ -4032,13 +4352,11 @@ def render_active_trades():
                 quantity = st.number_input("Shares", min_value=1, value=1, step=1)
                 paper_trade = st.checkbox("Paper trade", value=True, key="manual_paper_trade")
             with c2:
-                entry = st.number_input("Filled entry price", min_value=0.0, step=0.01, format="%.2f")
+                entry = st.number_input("Actual fill price", min_value=0.0, step=0.01, format="%.2f")
                 stop = st.number_input("Stop loss", min_value=0.0, step=0.01, format="%.2f")
                 target = st.number_input("Target price", min_value=0.0, step=0.01, format="%.2f")
-            already_filled = st.checkbox(
-                "I confirm this trade has already filled at the entry price"
-            )
-            clicked = st.form_submit_button("Record filled trade", use_container_width=True)
+            already_filled = st.checkbox("I confirm this trade has already filled")
+            clicked = st.form_submit_button("Add entered trade", use_container_width=True)
 
         if clicked:
             valid = ticker and entry > 0 and stop > 0 and target > 0
@@ -4046,7 +4364,7 @@ def render_active_trades():
             if not valid:
                 st.error("Check the ticker and make sure the stop and target are on the correct sides of entry.")
             elif not already_filled:
-                st.error("Confirm that the trade has already filled before recording it as Active.")
+                st.error("Confirm that the trade has actually filled before adding it.")
             else:
                 try:
                     add_cloud_trade(
@@ -4059,12 +4377,34 @@ def render_active_trades():
                             "entry": float(entry),
                             "stop": float(stop),
                             "target": float(target),
-                            "notes": "PAPER TRADE | Manually confirmed filled" if paper_trade else "Manually confirmed filled",
+                            "notes": "PAPER TRADE | Manually entered" if paper_trade else "Manually entered",
                         },
                     )
                     st.rerun()
                 except Exception as error:
                     st.error(f"Trade could not be saved: {error}")
+
+    try:
+        legacy_pending = load_pending_orders(supabase, st.session_state.supabase_user_id)
+    except Exception:
+        legacy_pending = []
+
+    if legacy_pending:
+        with st.expander(f"Legacy pending orders from the old workflow ({len(legacy_pending)})"):
+            st.caption(
+                "The app no longer queues orders. Cancel these old pending records, then add a trade only if you actually enter it."
+            )
+            for order in legacy_pending:
+                c1, c2 = st.columns([3, 1])
+                c1.write(
+                    f"**{order['ticker']} {order['direction']}** · old entry ${float(order['entry_price']):.2f}"
+                )
+                if c2.button("Cancel", key=f"cancel_legacy_{order['id']}", use_container_width=True):
+                    try:
+                        cancel_pending_order(supabase, order["id"])
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Legacy order could not be cancelled: {error}")
 
     try:
         closed = load_closed_trades(supabase, st.session_state.supabase_user_id, limit=50)
@@ -4369,8 +4709,8 @@ def render_research():
         st.caption(
             "Backtests enter at the next session open, use ATR-based stops and 2:1 targets, "
             "assume the stop was hit first when one daily candle touches both levels, include "
-            "7.5 basis points per side, and reserve the final 30% of trades as an out-of-sample check. "
-            "Buy-and-hold is always invested, while strategy exposure is shown separately."
+            "7.5 basis points per side, reserve the final 30% as an out-of-sample check, and test "
+            "three chronological stability periods. Buy-and-hold is always invested, while strategy exposure is shown separately."
         )
 
     if result["oil_stats"] is not None:
@@ -4454,4 +4794,4 @@ else:
     render_research()
 
 st.divider()
-st.caption("Yahoo Finance prices may be delayed. The app is a decision-support tool, not a guarantee or personalized financial advice.")
+st.caption("Yahoo Finance prices may be delayed. Finder results are decision support, not guarantees. Active Trades only organizes positions you choose to enter.")
